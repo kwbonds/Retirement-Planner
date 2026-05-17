@@ -1,0 +1,18 @@
+# Local private data
+*.db
+*.sqlite
+*.sqlite3
+backups/
+restored_uploads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Streamlit/local
+.streamlit/secrets.toml
+
+# Mac
+.DS_Store
