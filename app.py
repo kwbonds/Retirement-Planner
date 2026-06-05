@@ -22,6 +22,7 @@ This app stores data locally in retirement_planner.db in the same folder.
 """
 
 from __future__ import annotations
+from datetime import datetime
 
 import shutil
 import sqlite3
@@ -251,7 +252,32 @@ def seed_defaults() -> None:
         "dashboard_roth_scenario_name": "No conversions",
         "roth_end_at_ss_age": "1",
         "show_purchase_impact_on_dashboard_chart": "1",
+        "dashboard_purchase_funding_override": "Auto practical candidate",
+        "dashboard_purchase_age_override_enabled": "0",
+        "dashboard_purchase_age_override": "0",
         "show_dashboard_today_dollars": "0",
+        "lifetime_comparison_age": "85",
+        "aca_full_annual_premium": "18000",
+        "aca_benchmark_silver_annual_premium": "26000",
+        "aca_selected_plan_annual_premium": "22000",
+        "aca_model_mode": "Formula",
+        "aca_use_400_fpl_cliff": "1",
+        "aca_include_oop_estimate": "0",
+        "aca_oop_if_under_target": "3000",
+        "aca_oop_if_over_target": "6000",
+
+        "aca_subsidized_annual_premium": "6000",
+        "irmaa_magi_threshold": "206000",
+        "irmaa_annual_surcharge": "0",
+
+        "aca_household_size": "2",
+        "aca_fpl_100": "21150",
+        "aca_target_fpl_percent": "400",
+        "aca_magi_safety_buffer": "1000",
+        "aca_medicare_age": "65",
+        "aca_start_age": "auto",
+        "aca_end_age": "auto",
+
     }
     with get_conn() as conn:
         for key, value in defaults.items():
@@ -259,6 +285,18 @@ def seed_defaults() -> None:
                 "INSERT OR IGNORE INTO assumptions (key, value) VALUES (?, ?)",
                 (key, value),
             )
+        # v71 migration: v69/v70 introduced Dashboard purchase funding controls, but
+        # existing databases may still have the old default "Saved purchase strategy".
+        # For Dashboard what-if work, Auto practical is the intended default because it
+        # updates funding as the purchase age changes.
+        conn.execute(
+            """
+            UPDATE assumptions
+            SET value = 'Auto practical candidate'
+            WHERE key = 'dashboard_purchase_funding_override'
+              AND value = 'Saved purchase strategy'
+            """
+        )
         conn.commit()
 
     accounts = read_accounts(active_only=False)
@@ -286,6 +324,7 @@ def seed_defaults() -> None:
             ("Fixed annual amount", 60, 72, "Fixed annual amount", 80000, "N/A", "Cash then Taxable", 0, "Configurable fixed annual conversion amount"),
             ("Fill 12% bracket", 60, 72, "Fill bracket", 0, "12%", "Cash then Taxable", 0, "Convert up to top of 12% taxable bracket; default end age is before RMDs"),
             ("Fill 22% bracket", 60, 72, "Fill bracket", 0, "22%", "Cash then Taxable", 0, "Convert up to top of 22% taxable bracket; default end age is before RMDs"),
+            ("Hybrid ACA", 60, 78, "Hybrid ACA", 0, "N/A", "Cash then Taxable", 0, "ACA years stay under MAGI target; after Medicare, continue conversions to reduce RMD pressure."),
         ]
         with get_conn() as conn:
             conn.executemany(
@@ -320,6 +359,71 @@ def seed_defaults() -> None:
         conn.execute(
             "UPDATE roth_conversion_scenarios SET name = 'Fixed annual amount' WHERE name = 'Fixed $80k/year' AND strategy = 'Fixed annual amount'"
         )
+        # Add ACA optimizer scenario to existing local databases that were created
+        # before this strategy existed. This does not overwrite user-edited scenarios.
+        existing_aca = conn.execute(
+            "SELECT COUNT(*) FROM roth_conversion_scenarios WHERE strategy = 'Optimize ACA' OR name = 'Optimize ACA'"
+        ).fetchone()[0]
+        if existing_aca == 0:
+            retirement_default_age = int(float(get_assumptions().get("retirement_age", defaults.get("retirement_age", 60))))
+            aca_default_end_age = int(float(get_assumptions().get("aca_medicare_age", defaults.get("aca_medicare_age", 65)))) - 1
+            conn.execute(
+                """
+                INSERT INTO roth_conversion_scenarios
+                    (name, start_age, end_age, strategy, annual_amount, target_bracket, pay_tax_from, other_taxable_income, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "Optimize ACA",
+                    retirement_default_age,
+                    aca_default_end_age,
+                    "Optimize ACA",
+                    0,
+                    "N/A",
+                    "Cash then Taxable",
+                    0,
+                    "Convert only up to the editable ACA MAGI target during ACA years; useful for ACA subsidy planning.",
+                ),
+            )
+        # Add Hybrid ACA scenario to existing local databases.
+        # Existing Optimize ACA scenarios may have been created with End Age at
+        # Medicare/ACA end, which made charts look like a hard stop. Extend the
+        # built-in default scenario label/window while calculation continues
+        # dynamically regardless.
+        rmd_default_age_for_aca = int(float(get_assumptions().get("rmd_start_age", defaults.get("rmd_start_age", 73))))
+        conn.execute(
+            """
+            UPDATE roth_conversion_scenarios
+            SET end_age = MAX(end_age, ?)
+            WHERE strategy = 'Optimize ACA' AND name = 'Optimize ACA'
+            """,
+            (max(rmd_default_age_for_aca + 5, 72),),
+        )
+
+        existing_hybrid_aca = conn.execute(
+            "SELECT COUNT(*) FROM roth_conversion_scenarios WHERE strategy = 'Hybrid ACA' OR name = 'Hybrid ACA'"
+        ).fetchone()[0]
+        if existing_hybrid_aca == 0:
+            retirement_default_age = int(float(get_assumptions().get("retirement_age", defaults.get("retirement_age", 60))))
+            rmd_default_age = int(float(get_assumptions().get("rmd_start_age", defaults.get("rmd_start_age", 73))))
+            conn.execute(
+                """
+                INSERT INTO roth_conversion_scenarios
+                    (name, start_age, end_age, strategy, annual_amount, target_bracket, pay_tax_from, other_taxable_income, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "Hybrid ACA",
+                    retirement_default_age,
+                    max(rmd_default_age + 5, 72),
+                    "Hybrid ACA",
+                    0,
+                    "N/A",
+                    "Cash then Taxable",
+                    0,
+                    "ACA years stay under MAGI target; after Medicare, continue 12% bracket fills, pre-RMD 22% cleanup, then taper in RMD years.",
+                ),
+            )
         conn.commit()
 
 
@@ -380,14 +484,20 @@ def read_balance_history() -> pd.DataFrame:
 
 
 def read_contributions(active_only: bool = True) -> pd.DataFrame:
+    # LEFT JOIN keeps orphaned/legacy contribution rows visible so they can be fixed
+    # in the inline editor instead of silently disappearing or showing a blank account.
     query = """
-        SELECT c.*, a.name, a.tax_bucket
+        SELECT
+            c.*,
+            COALESCE(NULLIF(a.name, ''), '[Missing account #' || c.account_id || ']') AS name,
+            COALESCE(NULLIF(a.tax_bucket, ''), 'Unknown') AS tax_bucket,
+            CASE WHEN a.id IS NULL OR a.name IS NULL OR TRIM(a.name) = '' THEN 1 ELSE 0 END AS account_missing
         FROM contributions c
-        JOIN accounts a ON a.id = c.account_id
+        LEFT JOIN accounts a ON a.id = c.account_id
     """
     if active_only:
         query += " WHERE c.is_active = 1"
-    query += " ORDER BY a.name, c.start_date, c.id"
+    query += " ORDER BY COALESCE(NULLIF(a.name, ''), '[Missing account #' || c.account_id || ']'), c.start_date, c.id"
     with get_conn() as conn:
         return pd.read_sql_query(query, conn, parse_dates=["start_date", "end_date"])
 
@@ -404,7 +514,7 @@ def read_roth_scenarios(active_only: bool = True) -> pd.DataFrame:
 def save_roth_scenario_editor(df_editor: pd.DataFrame) -> None:
     cleaned = df_editor.copy()
     cleaned = cleaned.dropna(subset=["Name", "Start Age", "End Age", "Strategy"], how="any")
-    valid_strategies = {"No conversions", "Fixed annual amount", "Fill bracket"}
+    valid_strategies = {"No conversions", "Fixed annual amount", "Fill bracket", "Optimize ACA", "Hybrid ACA"}
     valid_brackets = {"N/A", "10%", "12%", "22%", "24%", "32%", "35%"}
     valid_pay_sources = {"Cash then Taxable", "Taxable then Cash", "Cash only", "Taxable only", "Withhold from conversion"}
 
@@ -800,20 +910,63 @@ def save_balance_editor(df_editor: pd.DataFrame, account_name_to_id: dict[str, i
 
 def save_contribution_editor(df_editor: pd.DataFrame, account_name_to_id: dict[str, int]) -> None:
     cleaned = df_editor.copy()
-    cleaned = cleaned.dropna(subset=["Account", "Amount", "Frequency", "Start Date"], how="any")
+    cleaned = cleaned.dropna(subset=["Amount", "Frequency", "Start Date"], how="any")
+
+    # Normalize names so Streamlit/editor string quirks do not cause false
+    # "missing account" errors. Account ID is used as a fallback when present.
+    normalized_name_to_id = {str(k).strip(): int(v) for k, v in account_name_to_id.items() if str(k).strip()}
+
+    with get_conn() as conn:
+        valid_account_ids = {
+            int(row[0])
+            for row in conn.execute("SELECT id FROM accounts").fetchall()
+        }
+
     valid_frequencies = {"Monthly", "Semi-monthly", "Biweekly", "Annual", "One-time"}
     rows = []
+    skipped_rows = []
+
     for _, row in cleaned.iterrows():
-        account = str(row["Account"])
-        frequency = str(row["Frequency"])
-        if account not in account_name_to_id or frequency not in valid_frequencies:
+        account = "" if pd.isna(row.get("Account")) else str(row.get("Account")).strip()
+        frequency = str(row["Frequency"]).strip()
+
+        account_id = None
+        account_id_value = row.get("Account ID")
+
+        # Prefer the visible account selection if it is valid.
+        if account in normalized_name_to_id:
+            account_id = normalized_name_to_id[account]
+        elif pd.notna(account_id_value):
+            try:
+                candidate_id = int(float(account_id_value))
+                if candidate_id in valid_account_ids:
+                    account_id = candidate_id
+            except Exception:
+                account_id = None
+
+        # Streamlit's editable grid can sometimes blank the visible Account
+        # name column during rerenders while still preserving Account ID.
+        # If the Account ID is valid, recover the name instead of rejecting
+        # the row and wiping the visible value on refresh.
+        if (not account) and account_id is not None:
+            try:
+                account = next(
+                    k for k, v in normalized_name_to_id.items()
+                    if int(v) == int(account_id)
+                )
+            except StopIteration:
+                pass
+
+        if account_id is None or frequency not in valid_frequencies:
+            skipped_rows.append(account or f"Account ID {account_id_value}")
             continue
+
         end_value = row.get("End Date")
         end_date = None if pd.isna(end_value) or end_value in ("", None) else pd.to_datetime(end_value).date().isoformat()
         existing_id = row.get("ID")
         rows.append((
             None if pd.isna(existing_id) else int(existing_id),
-            account_name_to_id[account],
+            int(account_id),
             float(row["Amount"]),
             frequency,
             pd.to_datetime(row["Start Date"]).date().isoformat(),
@@ -821,6 +974,12 @@ def save_contribution_editor(df_editor: pd.DataFrame, account_name_to_id: dict[s
             "" if pd.isna(row.get("Notes")) else str(row.get("Notes")),
             1 if bool(row.get("Active", True)) else 0,
         ))
+
+    if skipped_rows:
+        raise ValueError(
+            "Some contribution rows have missing/invalid accounts. Select a valid Account before saving: "
+            + ", ".join(sorted(set(skipped_rows)))
+        )
 
     with get_conn() as conn:
         conn.execute("DELETE FROM contributions")
@@ -1330,6 +1489,69 @@ def max_conversion_to_fill_bracket_with_ss_feedback(
     return max(min(lo, available_tax_deferred), 0.0)
 
 
+
+def aca_start_age(assumptions: Dict[str, str]) -> int:
+    """ACA planning usually starts when employer coverage stops: retirement age."""
+    value = str(assumptions.get("aca_start_age", "auto")).strip().lower()
+    if value in {"", "auto", "retirement", "retirement age"}:
+        return int(float(assumptions.get("retirement_age", 60)))
+    return int(float(value))
+
+
+def aca_end_age(assumptions: Dict[str, str]) -> int:
+    """ACA planning usually ends the year before Medicare eligibility."""
+    value = str(assumptions.get("aca_end_age", "auto")).strip().lower()
+    medicare_age = int(float(assumptions.get("aca_medicare_age", 65)))
+    if value in {"", "auto", "medicare", "medicare age"}:
+        return medicare_age - 1
+    return int(float(value))
+
+
+def aca_magi_limit(assumptions: Dict[str, str]) -> float:
+    fpl_100 = float(assumptions.get("aca_fpl_100", 21150))
+    target_pct = float(assumptions.get("aca_target_fpl_percent", 400))
+    buffer = float(assumptions.get("aca_magi_safety_buffer", 1000))
+    return max(fpl_100 * (target_pct / 100.0) - buffer, 0.0)
+
+
+def estimate_aca_magi(pre_conversion_income: float, conversion_amount: float, social_security: float, taxable_gain_income: float = 0.0) -> float:
+    """Simplified ACA MAGI estimate.
+
+    ACA MAGI generally includes AGI plus tax-exempt interest and excluded foreign income.
+    For this app's planning model, we include ordinary pre-conversion income, Roth conversions,
+    taxable brokerage gains, and taxable Social Security feedback.
+    """
+    pre = max(float(pre_conversion_income), 0.0)
+    conv = max(float(conversion_amount), 0.0)
+    gains = max(float(taxable_gain_income), 0.0)
+    taxable_ss = estimate_taxable_social_security(float(social_security), pre + conv + gains)
+    return pre + conv + gains + taxable_ss
+
+
+def max_conversion_for_aca_magi(
+    pre_conversion_income: float,
+    social_security: float,
+    taxable_gain_income: float,
+    magi_limit: float,
+    available_tax_deferred: float,
+) -> float:
+    available_tax_deferred = max(float(available_tax_deferred), 0.0)
+    if available_tax_deferred <= 0:
+        return 0.0
+    current_magi = estimate_aca_magi(pre_conversion_income, 0.0, social_security, taxable_gain_income)
+    if current_magi >= magi_limit:
+        return 0.0
+    lo, hi = 0.0, available_tax_deferred
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        magi_mid = estimate_aca_magi(pre_conversion_income, mid, social_security, taxable_gain_income)
+        if magi_mid <= magi_limit:
+            lo = mid
+        else:
+            hi = mid
+    return max(min(lo, available_tax_deferred), 0.0)
+
+
 def target_bracket_top(target_bracket: str, assumptions: Dict[str, str]) -> float:
     key = str(target_bracket).replace("%", "").strip()
     mapping = {
@@ -1383,7 +1605,21 @@ def calculate_roth_conversion_amount(
 
     start_age, end_age, _linked_to_ss = effective_roth_conversion_window(assumptions, roth_scenario)
     strategy = str(roth_scenario.get("strategy", "No conversions"))
-    if strategy == "No conversions" or not (start_age <= age <= end_age):
+
+    # ACA-aware strategies should not hard-stop at the ACA/Medicare boundary.
+    # Their scenario Start/End Age still controls the low-income/ACA window label,
+    # but the strategy itself continues after ACA using bracket-fill/taper logic.
+    if strategy in {"Optimize ACA", "Hybrid ACA"}:
+        rmd_age = int(float(assumptions.get("rmd_start_age", 73)))
+        projection_end_age = int(float(assumptions.get("current_age", 52))) + int(float(assumptions.get("years_to_project", 35)))
+        strategy_end_age = max(end_age, rmd_age + 8, projection_end_age)
+        if age < start_age or age > strategy_end_age:
+            return 0.0, 0.0, strategy, 0.0, "—", 0.0
+    else:
+        if strategy == "No conversions" or not (start_age <= age <= end_age):
+            return 0.0, 0.0, strategy, 0.0, "—", 0.0
+
+    if strategy == "No conversions":
         return 0.0, 0.0, strategy, 0.0, "—", 0.0
 
     available_tax_deferred = float(current.loc[current["tax_bucket"] == "Tax-deferred", "balance"].sum())
@@ -1414,6 +1650,76 @@ def calculate_roth_conversion_amount(
             available_tax_deferred=available_tax_deferred,
             assumptions=assumptions,
         )
+    elif strategy == "Optimize ACA":
+        start_aca = aca_start_age(assumptions)
+        end_aca = aca_end_age(assumptions)
+
+        if start_aca <= age <= end_aca:
+            amount = max_conversion_for_aca_magi(
+                pre_conversion_income=pre_conversion_income,
+                social_security=float(social_security),
+                taxable_gain_income=max(float(taxable_gain_income), 0.0),
+                magi_limit=aca_magi_limit(assumptions),
+                available_tax_deferred=available_tax_deferred,
+            )
+        else:
+            # After ACA years, continue with a conservative 12% bracket-fill strategy.
+            amount = max_conversion_to_fill_bracket_with_ss_feedback(
+                pre_conversion_income=pre_conversion_income,
+                social_security=float(social_security),
+                target_top=target_bracket_top("12%", assumptions),
+                available_tax_deferred=available_tax_deferred,
+                assumptions=assumptions,
+            )
+
+    elif strategy == "Hybrid ACA":
+        start_aca = aca_start_age(assumptions)
+        end_aca = aca_end_age(assumptions)
+        social_security_age = int(float(assumptions.get("social_security_age", 67)))
+        medicare_age = int(float(assumptions.get("aca_medicare_age", 65)))
+
+        if start_aca <= age <= end_aca:
+            # During ACA years, preserve subsidies by staying under MAGI targets.
+            amount = max_conversion_for_aca_magi(
+                pre_conversion_income=pre_conversion_income,
+                social_security=float(social_security),
+                taxable_gain_income=max(float(taxable_gain_income), 0.0),
+                magi_limit=aca_magi_limit(assumptions),
+                available_tax_deferred=available_tax_deferred,
+            )
+
+        elif medicare_age <= age < 70:
+            # Medicare but before/around early SS years: ACA cliff is gone, so
+            # resume meaningful conversions by filling the 12% bracket.
+            amount = max_conversion_to_fill_bracket_with_ss_feedback(
+                pre_conversion_income=pre_conversion_income,
+                social_security=float(social_security),
+                target_top=target_bracket_top("12%", assumptions),
+                available_tax_deferred=available_tax_deferred,
+                assumptions=assumptions,
+            )
+
+        elif 70 <= age < int(float(assumptions.get("rmd_start_age", 73))):
+            # Pre-RMD cleanup window: allow moderate 22% conversions while
+            # there is still time to reduce future RMD pressure.
+            amount = max_conversion_to_fill_bracket_with_ss_feedback(
+                pre_conversion_income=pre_conversion_income,
+                social_security=float(social_security),
+                target_top=target_bracket_top("22%", assumptions),
+                available_tax_deferred=available_tax_deferred,
+                assumptions=assumptions,
+            )
+
+        else:
+            # RMD years and later: taper back to 12% bracket fills.
+            amount = max_conversion_to_fill_bracket_with_ss_feedback(
+                pre_conversion_income=pre_conversion_income,
+                social_security=float(social_security),
+                target_top=target_bracket_top("12%", assumptions),
+                available_tax_deferred=available_tax_deferred,
+                assumptions=assumptions,
+            )
+
     else:
         amount = 0.0
 
@@ -1502,6 +1808,7 @@ def build_projection(years: int, assumptions: Dict[str, str], roth_scenario: dic
     purchases_df = purchases_for_projection(purchases_override=purchases_override, ignore_purchases=ignore_purchases)
 
     current_age = int(float(assumptions.get("current_age", 52)))
+    current_year = datetime.now().year
     base_retirement_age = int(float(assumptions.get("retirement_age", 58)))
     apply_layoff_pause = assumptions.get("apply_layoff_pause_scenario", "0") == "1"
     layoff_pause_months = int(float(assumptions.get("layoff_pause_months", 0))) if apply_layoff_pause else 0
@@ -1573,6 +1880,17 @@ def build_projection(years: int, assumptions: Dict[str, str], roth_scenario: dic
         ordinary_taxable_income = 0.0
         total_annual_tax = 0.0
         ordinary_marginal_bracket = "—"
+        aca_magi_before_conversion = 0.0
+        aca_magi_after_conversion = 0.0
+        aca_magi_limit_value = aca_magi_limit(assumptions)
+        aca_headroom_after_conversion = 0.0
+        aca_status = "Not ACA year"
+        aca_fpl_percent = 0.0
+        aca_annual_premium_cost = 0.0
+        aca_annual_oop_estimate = 0.0
+        aca_annual_healthcare_cost = 0.0
+        aca_estimated_subsidy = 0.0
+        aca_cost_status = "Not ACA year"
         marginal_bracket_reached = ""
         purchase_amount = 0.0
         purchase_names = ""
@@ -1666,9 +1984,50 @@ def build_projection(years: int, assumptions: Dict[str, str], roth_scenario: dic
 
             cumulative_estimated_tax += total_annual_tax
 
+        # ACA MAGI must include purchase funding effects too.
+        # Tax-deferred purchase dollars are ordinary income; taxable-purchase gains
+        # also increase ACA MAGI. Without this, the purchase optimizer can wrongly
+        # prefer "tax-deferred only" during ACA years even though it would blow
+        # through the subsidy cliff.
+        ordinary_income_for_aca = (
+            float(assumptions.get("base_taxable_income_retirement", 0.0))
+            + max(float(estimated_rmd), 0.0)
+            + max(float(purchase_tax_deferred_withdrawal), 0.0)
+        )
+        taxable_gain_income_for_aca = (
+            max(float(taxable_gain_realized), 0.0)
+            + max(float(purchase_taxable_gain), 0.0)
+        )
+        aca_magi_before_conversion = estimate_aca_magi(
+            pre_conversion_income=ordinary_income_for_aca,
+            conversion_amount=0.0,
+            social_security=float(social_security),
+            taxable_gain_income=float(taxable_gain_income_for_aca),
+        )
+        aca_magi_after_conversion = estimate_aca_magi(
+            pre_conversion_income=ordinary_income_for_aca,
+            conversion_amount=float(roth_conversion),
+            social_security=float(social_security),
+            taxable_gain_income=float(taxable_gain_income_for_aca),
+        )
+        aca_magi_limit_value = aca_magi_limit(assumptions)
+        aca_headroom_after_conversion = max(aca_magi_limit_value - aca_magi_after_conversion, 0.0)
+        if aca_start_age(assumptions) <= age <= aca_end_age(assumptions):
+            aca_status = "Under target" if aca_magi_after_conversion <= aca_magi_limit_value else "Over target"
+            aca_cost_details = estimate_aca_annual_cost_from_magi(aca_magi_after_conversion, assumptions)
+            aca_fpl_percent = float(aca_cost_details["ACA FPL Percent"])
+            aca_annual_premium_cost = float(aca_cost_details["ACA Annual Premium Cost"])
+            aca_annual_oop_estimate = float(aca_cost_details["ACA Annual OOP Estimate"])
+            aca_annual_healthcare_cost = float(aca_cost_details["ACA Annual Healthcare Cost"])
+            aca_estimated_subsidy = float(aca_cost_details["ACA Estimated Subsidy"])
+            aca_cost_status = str(aca_cost_details["ACA Cost Status"])
+        else:
+            aca_status = "Not ACA year"
+            aca_cost_status = "Not ACA year"
+
         by_bucket = current.groupby("tax_bucket")["balance"].sum().to_dict()
         rows.append({
-            "Year": year,
+            "Year": current_year + year,
             "Age": age,
             "Retired": is_retired,
             "Total": total,
@@ -1693,6 +2052,17 @@ def build_projection(years: int, assumptions: Dict[str, str], roth_scenario: dic
             "Income Tax": ordinary_income_tax,
             "Taxable Brokerage Withdrawal": taxable_brokerage_withdrawal,
             "Taxable Gain Realized": taxable_gain_realized,
+            "ACA MAGI Before Conversion": aca_magi_before_conversion,
+            "ACA MAGI After Conversion": aca_magi_after_conversion,
+            "ACA MAGI Limit": aca_magi_limit_value,
+            "ACA Headroom After Conversion": aca_headroom_after_conversion,
+            "ACA Status": aca_status,
+            "ACA FPL Percent": aca_fpl_percent,
+            "ACA Annual Premium Cost": aca_annual_premium_cost,
+            "ACA Annual OOP Estimate": aca_annual_oop_estimate,
+            "ACA Annual Healthcare Cost": aca_annual_healthcare_cost,
+            "ACA Estimated Subsidy": aca_estimated_subsidy,
+            "ACA Cost Status": aca_cost_status,
             "Capital Gains Tax": capital_gains_tax,
             "Estimated Total Annual Tax": total_annual_tax,
             "Cumulative Estimated Tax": cumulative_estimated_tax,
@@ -1778,6 +2148,22 @@ def build_projection(years: int, assumptions: Dict[str, str], roth_scenario: dic
 
 def format_money(value: float) -> str:
     return f"${value:,.0f}"
+
+
+def direction_arrow(current_value: float, previous_value: float | None, tolerance: float = 1.0) -> str:
+    """Small visual indicator for table cells that changed from the prior row."""
+    if previous_value is None:
+        return ""
+    change = float(current_value) - float(previous_value)
+    if change > tolerance:
+        return " 🟢↑"
+    if change < -tolerance:
+        return " 🔴↓"
+    return ""
+
+
+def format_money_with_direction(current_value: float, previous_value: float | None) -> str:
+    return f"{format_money(float(current_value))}{direction_arrow(float(current_value), previous_value)}"
 
 
 def purchasing_power_factor_for_age(age: float, assumptions: Dict[str, str]) -> float:
@@ -1996,6 +2382,186 @@ def projection_with_after_tax_estimate(projection: pd.DataFrame, assumptions: Di
     out = add_withdrawal_plan_columns(out)
     return out
 
+
+def comparison_through_age(assumptions: Dict[str, str]) -> int:
+    """Age used for lifetime tax / healthcare comparison metrics."""
+    return int(float(assumptions.get("lifetime_comparison_age", 85)))
+
+
+def projection_row_at_or_before_age(projection: pd.DataFrame, age: int) -> pd.Series:
+    """Return the row for age, or the last projected row before it."""
+    if projection.empty:
+        return pd.Series(dtype="object")
+    rows = projection[projection["Age"].astype(int) <= int(age)]
+    if rows.empty:
+        return projection.iloc[0]
+    return rows.iloc[-1]
+
+
+def projection_through_age(projection: pd.DataFrame, age: int) -> pd.DataFrame:
+    if projection.empty:
+        return projection.copy()
+    return projection[projection["Age"].astype(int) <= int(age)].copy()
+
+
+
+def aca_expected_contribution_rate(fpl_percent: float, assumptions: Dict[str, str]) -> float:
+    """Approximate ACA household expected contribution rate.
+
+    The app defaults to the 2026 post-enhanced-subsidy-style curve:
+    under 133% FPL: 2.10%
+    133–150%: 3.14%–4.19%
+    150–200%: 4.19%–6.60%
+    200–250%: 6.60%–8.44%
+    250–300%: 8.44%–9.96%
+    300–400%: 9.96%
+    over 400%: no subsidy if the cliff is enabled.
+    """
+    fpl = max(float(fpl_percent), 0.0)
+    if fpl < 133:
+        return 0.0210
+    if fpl < 150:
+        return 0.0314 + (fpl - 133) / (150 - 133) * (0.0419 - 0.0314)
+    if fpl < 200:
+        return 0.0419 + (fpl - 150) / (200 - 150) * (0.0660 - 0.0419)
+    if fpl < 250:
+        return 0.0660 + (fpl - 200) / (250 - 200) * (0.0844 - 0.0660)
+    if fpl < 300:
+        return 0.0844 + (fpl - 250) / (300 - 250) * (0.0996 - 0.0844)
+    if fpl <= 400:
+        return 0.0996
+    return 1.0 if assumptions.get("aca_use_400_fpl_cliff", "1") == "1" else 0.0996
+
+
+def estimate_aca_annual_cost_from_magi(magi: float, assumptions: Dict[str, str]) -> dict[str, float | str]:
+    """Estimate household ACA premium/OOP cost for one year.
+
+    Inputs are household annual numbers, not per-person numbers.
+    """
+    magi = max(float(magi), 0.0)
+    fpl100 = max(float(assumptions.get("aca_fpl_100", 21150)), 1.0)
+    fpl_percent = 100.0 * magi / fpl100
+    target_limit = aca_magi_limit(assumptions)
+    mode = str(assumptions.get("aca_model_mode", "Formula"))
+
+    # Legacy/manual mode preserves the old simple under/over target model.
+    if mode.lower().startswith("manual"):
+        full_premium = float(assumptions.get("aca_full_annual_premium", 18000))
+        subsidized_premium = float(assumptions.get("aca_subsidized_annual_premium", 6000))
+        premium = subsidized_premium if magi <= target_limit else full_premium
+        subsidy = max(full_premium - premium, 0.0)
+        status = "Under target" if magi <= target_limit else "Over target"
+    else:
+        benchmark = float(assumptions.get("aca_benchmark_silver_annual_premium", assumptions.get("aca_full_annual_premium", 18000)))
+        selected_plan = float(assumptions.get("aca_selected_plan_annual_premium", benchmark))
+        cliff_enabled = assumptions.get("aca_use_400_fpl_cliff", "1") == "1"
+        if cliff_enabled and fpl_percent > 400:
+            expected_contribution = benchmark
+            subsidy = 0.0
+            status = "Over 400% FPL cliff"
+        else:
+            rate = aca_expected_contribution_rate(fpl_percent, assumptions)
+            expected_contribution = magi * rate
+            subsidy = max(benchmark - expected_contribution, 0.0)
+            status = "Subsidy eligible" if subsidy > 0 else "No subsidy"
+        premium = max(selected_plan - subsidy, 0.0)
+
+    oop = 0.0
+    if assumptions.get("aca_include_oop_estimate", "0") == "1":
+        oop = float(assumptions.get("aca_oop_if_under_target", 3000)) if magi <= target_limit else float(assumptions.get("aca_oop_if_over_target", 6000))
+
+    return {
+        "ACA Annual Premium Cost": max(float(premium), 0.0),
+        "ACA Annual OOP Estimate": max(float(oop), 0.0),
+        "ACA Annual Healthcare Cost": max(float(premium) + float(oop), 0.0),
+        "ACA Estimated Subsidy": max(float(subsidy), 0.0),
+        "ACA FPL Percent": fpl_percent,
+        "ACA Cost Status": status,
+    }
+
+
+def estimate_aca_premium_cost(projection: pd.DataFrame, assumptions: Dict[str, str], through_age: int) -> float:
+    """Estimate household ACA cost through a target age.
+
+    This uses household annual premium assumptions. In Formula mode, it estimates
+    premium tax credits from MAGI, FPL, benchmark silver premium, selected-plan
+    premium, and the optional 400% FPL cliff. In Manual mode, it uses the older
+    under-target / over-target premium assumptions.
+    """
+    if projection.empty:
+        return 0.0
+    start_age = aca_start_age(assumptions)
+    end_age = min(aca_end_age(assumptions), int(through_age))
+    if end_age < start_age:
+        return 0.0
+
+    total = 0.0
+    for _, row in projection.iterrows():
+        age = int(row.get("Age", 0))
+        if not (start_age <= age <= end_age):
+            continue
+        magi = float(row.get("ACA MAGI After Conversion", 0.0) or 0.0)
+        total += float(estimate_aca_annual_cost_from_magi(magi, assumptions)["ACA Annual Healthcare Cost"])
+    return total
+
+def estimate_irmaa_cost(projection: pd.DataFrame, assumptions: Dict[str, str], through_age: int) -> float:
+    """Very simplified Medicare IRMAA planning estimate.
+
+    Uses an editable MAGI threshold and annual surcharge. This is intentionally
+    approximate because IRMAA uses a two-year lookback and multiple brackets.
+    """
+    if projection.empty:
+        return 0.0
+    medicare_age = int(float(assumptions.get("aca_medicare_age", 65)))
+    threshold = float(assumptions.get("irmaa_magi_threshold", 206000))
+    surcharge = float(assumptions.get("irmaa_annual_surcharge", 0))
+    total = 0.0
+    for _, row in projection.iterrows():
+        age = int(row.get("Age", 0))
+        if age < medicare_age or age > int(through_age):
+            continue
+        magi = float(row.get("ACA MAGI After Conversion", 0.0) or 0.0)
+        if magi > threshold:
+            total += surcharge
+    return total
+
+
+def lifetime_strategy_metrics(projection: pd.DataFrame, assumptions: Dict[str, str]) -> dict:
+    """Decision-oriented cumulative tax and healthcare metrics."""
+    through_age = comparison_through_age(assumptions)
+    subset = projection_through_age(projection, through_age)
+    if subset.empty:
+        subset = projection.copy()
+
+    row = projection_row_at_or_before_age(projection, through_age)
+    subset = projection_with_after_tax_estimate(subset, assumptions) if not subset.empty else subset
+    row_df = projection_with_after_tax_estimate(pd.DataFrame([row]), assumptions) if not row.empty else pd.DataFrame()
+    row_after_tax = float(row_df.iloc[0].get("After-tax Estimate", 0.0)) if not row_df.empty else 0.0
+
+    total_tax = float(subset["Estimated Total Annual Tax"].sum()) if "Estimated Total Annual Tax" in subset else 0.0
+    roth_tax = float(subset["Estimated Roth Tax"].sum()) if "Estimated Roth Tax" in subset else 0.0
+    ordinary_tax = float(subset["Income Tax"].sum()) if "Income Tax" in subset else 0.0
+    cap_gains_tax = float(subset["Capital Gains Tax"].sum()) if "Capital Gains Tax" in subset else 0.0
+    cumulative_rmds = float(subset["Estimated RMD"].sum()) if "Estimated RMD" in subset else 0.0
+    aca_cost = estimate_aca_premium_cost(projection, assumptions, through_age)
+    irmaa_cost = estimate_irmaa_cost(projection, assumptions, through_age)
+
+    return {
+        "Comparison Through Age": through_age,
+        "Lifetime Estimated Tax": total_tax,
+        "Lifetime Roth Conversion Tax": roth_tax,
+        "Lifetime Ordinary Income Tax": ordinary_tax,
+        "Lifetime Capital Gains Tax": cap_gains_tax,
+        "Estimated ACA Premium Cost": aca_cost,
+        "Estimated IRMAA Cost": irmaa_cost,
+        "Total Tax + Healthcare Cost": total_tax + aca_cost + irmaa_cost,
+        "Cumulative RMDs": cumulative_rmds,
+        "Tax-deferred at Comparison Age": float(row.get("Tax-deferred", 0.0) or 0.0),
+        "Roth at Comparison Age": float(row.get("Roth", 0.0) or 0.0),
+        "After-tax Value at Comparison Age": row_after_tax,
+    }
+
+
 def summarize_projection(projection: pd.DataFrame, assumptions: Dict[str, str]) -> dict:
     projection = projection_with_after_tax_estimate(projection, assumptions)
     ending = projection.iloc[-1]
@@ -2003,7 +2569,10 @@ def summarize_projection(projection: pd.DataFrame, assumptions: Dict[str, str]) 
     total_converted = float(projection["Roth Conversion"].sum()) if "Roth Conversion" in projection else 0.0
     ending_tax_deferred = float(ending.get("Tax-deferred", 0.0))
     after_tax_ending = float(ending["After-tax Estimate"])
+    lifetime_metrics = lifetime_strategy_metrics(projection, assumptions)
+
     return {
+        **lifetime_metrics,
         "Ending Age": int(ending["Age"]),
         "Ending Total": float(ending["Total"]),
         "After-tax Ending Estimate": after_tax_ending,
@@ -2278,6 +2847,26 @@ def render_annual_roth_conversion_chart(projection: pd.DataFrame, assumptions: D
     st.caption(
         "This shows whether conversions stop or taper. For bracket-fill plans, Social Security, RMDs, taxable brokerage gains, and conversion-driven Social Security taxation reduce available bracket room after they begin."
     )
+
+    strategy = str(roth_scenario.get("strategy", "")) if roth_scenario is not None else ""
+    rmd_start_age = int(float(assumptions.get("rmd_start_age", 73)))
+    if strategy == "Hybrid ACA":
+        st.info(
+            f"Hybrid ACA strategy: ACA years preserve subsidies by staying under the MAGI target. "
+            f"After Medicare, conversions continue. Ages 70–{rmd_start_age - 1} intentionally allow larger 22% bracket cleanup conversions "
+            f"to reduce the future tax-deferred balance and soften the RMD spike. In RMD years, the strategy tapers back toward 12% bracket fills."
+        )
+    elif strategy == "Optimize ACA":
+        st.info(
+            "Optimize ACA strategy: ACA years prioritize staying under the MAGI target. "
+            "After ACA/Medicare, the model continues smaller conservative conversions instead of hard-stopping, so you can still reduce future RMD pressure."
+        )
+    elif strategy == "Fill bracket":
+        st.info(
+            "Fill-bracket strategy: larger conversions are intentional when bracket room is available. "
+            "This may raise taxes now, but it can reduce future RMDs, Social Security taxation, IRMAA risk, and later-life tax-deferred balances."
+        )
+
     fig = px.bar(
         projection,
         x="Age",
@@ -2317,17 +2906,42 @@ def page_dashboard() -> None:
     selected_roth_name = saved_roth_name
     show_today_dollars = assumptions.get("show_dashboard_today_dollars", "0") == "1"
     show_purchase_impacts = assumptions.get("show_purchase_impact_on_dashboard_chart", "1") == "1"
+    dashboard_purchase_funding_override = assumptions.get("dashboard_purchase_funding_override", "Auto practical candidate")
+    dashboard_purchase_age_override_enabled = assumptions.get("dashboard_purchase_age_override_enabled", "0") == "1"
+    dashboard_purchase_age_override_raw = int(float(assumptions.get("dashboard_purchase_age_override", 0) or 0))
 
     # Dashboard purchase toggle controls whether planned purchases actually affect this chart and snapshot.
     # The Include checkbox on the Purchase Planner marks purchases as eligible; this Dashboard toggle
-    # turns their impact on/off for visual comparison.
+    # turns their impact on/off for visual comparison. The funding/age overrides let you test without
+    # changing the saved Purchase Planner row.
+    active_dashboard_purchases_base = read_planned_purchases(active_only=True) if show_purchase_impacts else pd.DataFrame()
+    default_purchase_age = (
+        int(active_dashboard_purchases_base.iloc[0]["purchase_age"])
+        if not active_dashboard_purchases_base.empty
+        else int(float(assumptions.get("retirement_age", 57)))
+    )
+    dashboard_purchase_age_override = dashboard_purchase_age_override_raw if dashboard_purchase_age_override_raw > 0 else default_purchase_age
+    effective_dashboard_purchase_age = dashboard_purchase_age_override if dashboard_purchase_age_override_enabled else None
+    active_dashboard_purchases, effective_dashboard_purchase_funding = (
+        dashboard_purchase_rows_with_override(
+            active_dashboard_purchases_base,
+            dashboard_purchase_funding_override,
+            assumptions=assumptions,
+            roth_scenario=roth_scenario,
+            years=projection_years,
+            age_override=effective_dashboard_purchase_age,
+        )
+        if show_purchase_impacts
+        else (pd.DataFrame(), "")
+    )
+
     projection = build_projection(
         projection_years,
         assumptions,
         roth_scenario=roth_scenario,
+        purchases_override=active_dashboard_purchases if show_purchase_impacts else None,
         ignore_purchases=not show_purchase_impacts,
     )
-    active_dashboard_purchases = read_planned_purchases(active_only=True) if show_purchase_impacts else pd.DataFrame()
 
     years_to_retirement = max(effective_retirement_age - current_age, 0)
     retirement_projection_row = (
@@ -2335,6 +2949,7 @@ def page_dashboard() -> None:
             years_to_retirement,
             assumptions,
             roth_scenario=roth_scenario,
+            purchases_override=active_dashboard_purchases if show_purchase_impacts else None,
             ignore_purchases=not show_purchase_impacts,
         ).iloc[-1]
         if years_to_retirement > 0
@@ -2383,7 +2998,7 @@ def page_dashboard() -> None:
 
     # Dashboard controls live beside the chart they affect.
     st.subheader("Projection controls")
-    ctrl1, ctrl2, ctrl3 = st.columns([2.2, 1.3, 1.3])
+    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([2.1, 1.0, 1.0, 1.8, 1.8])
 
     with ctrl1:
         if not active_roth_scenarios.empty:
@@ -2430,6 +3045,55 @@ def page_dashboard() -> None:
             set_assumption("show_purchase_impact_on_dashboard_chart", "1" if new_show_purchase_impacts else "0")
             st.rerun()
 
+    with ctrl4:
+        purchase_override_options = ["Auto practical candidate", "Saved purchase strategy"] + purchase_funding_candidate_labels()
+        override_idx = (
+            purchase_override_options.index(dashboard_purchase_funding_override)
+            if dashboard_purchase_funding_override in purchase_override_options
+            else 0
+        )
+        new_purchase_override = st.selectbox(
+            "Dashboard purchase funding",
+            purchase_override_options,
+            index=override_idx,
+            disabled=not show_purchase_impacts,
+            help=(
+                "Dashboard-only funding control. Auto practical candidate is the default and updates when purchase age changes: "
+                "ACA years prioritize ACA-safe funding; after ACA it can prefer tax-deferred funding to reduce RMD pressure."
+            ),
+        )
+        if new_purchase_override != dashboard_purchase_funding_override:
+            set_assumption("dashboard_purchase_funding_override", new_purchase_override)
+            st.rerun()
+
+    with ctrl5:
+        age_override_enabled = st.checkbox(
+            "Override purchase age",
+            value=dashboard_purchase_age_override_enabled,
+            disabled=not show_purchase_impacts or active_dashboard_purchases_base.empty,
+            help="Dashboard-only age override. This lets you move the planned purchase on the chart without editing the saved Purchase Planner row.",
+        )
+        if age_override_enabled != dashboard_purchase_age_override_enabled:
+            set_assumption("dashboard_purchase_age_override_enabled", "1" if age_override_enabled else "0")
+            st.rerun()
+
+        if not active_dashboard_purchases_base.empty:
+            new_purchase_age_override = st.slider(
+                "Purchase age",
+                min_value=int(float(assumptions.get("current_age", 52))),
+                max_value=90,
+                value=int(dashboard_purchase_age_override),
+                step=1,
+                disabled=not show_purchase_impacts or not age_override_enabled,
+                help="Move the active purchase earlier/later on the Dashboard projection.",
+            )
+            if int(new_purchase_age_override) != int(dashboard_purchase_age_override):
+                set_assumption("dashboard_purchase_age_override", str(int(new_purchase_age_override)))
+                # Changing the age should default back to the age-aware practical candidate.
+                # Users can still choose an explicit funding candidate after the age is set.
+                set_assumption("dashboard_purchase_funding_override", "Auto practical candidate")
+                st.rerun()
+
     render_roth_window_callout(assumptions, roth_scenario, selected_roth_name)
 
     if show_today_dollars:
@@ -2443,10 +3107,66 @@ def page_dashboard() -> None:
 
     if not active_dashboard_purchases.empty:
         included_summary = ", ".join(
-            f"{str(r['name'])} at age {int(r['purchase_age'])} ({format_money(float(r['amount']))})"
+            f"{str(r['name'])} at age {int(r['purchase_age'])} ({format_money(float(r['amount']))}, funded by {purchase_strategy_display_name(str(r['funding_strategy']))})"
             for _, r in active_dashboard_purchases.iterrows()
         )
-        st.caption(f"Active planned purchases included in Dashboard projection: {included_summary}.")
+        if dashboard_purchase_funding_override == "Saved purchase strategy" and not dashboard_purchase_age_override_enabled:
+            st.caption(f"Active planned purchases included in Dashboard projection: {included_summary}.")
+        else:
+            extra_bits = []
+            if dashboard_purchase_funding_override == "Auto practical candidate":
+                extra_bits.append(f"auto practical funding: {effective_dashboard_purchase_funding}")
+            elif dashboard_purchase_funding_override != "Saved purchase strategy":
+                extra_bits.append(f"funding override: {effective_dashboard_purchase_funding}")
+            if dashboard_purchase_age_override_enabled:
+                extra_bits.append(f"age override: {dashboard_purchase_age_override}")
+            suffix = "; ".join(extra_bits)
+            st.caption(f"Active planned purchases included in Dashboard projection ({suffix}): {included_summary}.")
+
+        # Show the actual bucket withdrawals used in the current Dashboard projection.
+        # This makes it clear whether the chart is using brokerage, traditional, Roth, or cash.
+        purchase_ages = set(active_dashboard_purchases["purchase_age"].astype(int).tolist())
+        purchase_rows = projection[projection["Age"].astype(int).isin(purchase_ages)].copy()
+        if not purchase_rows.empty:
+            breakdown_cols = [
+                "Age",
+                "Purchase Names",
+                "Purchase Funding Strategy",
+                "Purchase Amount",
+                "Purchase Cash Withdrawal",
+                "Purchase Taxable Withdrawal",
+                "Purchase Tax-deferred Withdrawal",
+                "Purchase Roth Withdrawal",
+                "Purchase Estimated Tax",
+                "ACA MAGI After Conversion",
+                "ACA Status",
+            ]
+            breakdown_cols = [c for c in breakdown_cols if c in purchase_rows.columns]
+            breakdown = purchase_rows[breakdown_cols].copy()
+            for col in [
+                "Purchase Amount",
+                "Purchase Cash Withdrawal",
+                "Purchase Taxable Withdrawal",
+                "Purchase Tax-deferred Withdrawal",
+                "Purchase Roth Withdrawal",
+                "Purchase Estimated Tax",
+                "ACA MAGI After Conversion",
+            ]:
+                if col in breakdown.columns:
+                    breakdown[col] = breakdown[col].map(lambda x: format_money(float(x)))
+            st.caption("Dashboard purchase funding breakdown for the current chart:")
+            st.dataframe(
+                breakdown,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Purchase Cash Withdrawal": st.column_config.TextColumn("Cash", help="Amount of purchase funded from Cash."),
+                    "Purchase Taxable Withdrawal": st.column_config.TextColumn("Taxable", help="Amount of purchase funded from taxable brokerage."),
+                    "Purchase Tax-deferred Withdrawal": st.column_config.TextColumn("Tax-deferred", help="Amount of purchase funded from traditional/401k/IRA."),
+                    "Purchase Roth Withdrawal": st.column_config.TextColumn("Roth", help="Amount of purchase funded from Roth."),
+                    "ACA MAGI After Conversion": st.column_config.TextColumn("ACA MAGI", help="Modeled ACA MAGI in the purchase year."),
+                },
+            )
 
     if assumptions.get("apply_market_downturn_scenario", "0") == "1" or assumptions.get("apply_layoff_pause_scenario", "0") == "1":
         st.warning("Dashboard includes active scenario assumptions from the Scenarios tab.")
@@ -2589,25 +3309,86 @@ def page_dashboard() -> None:
             st.info("Enter balances to see bucket allocation.")
 
     with st.expander("Projection details"):
+        st.caption("Balance columns include green ↑ / red ↓ arrows versus the prior year where applicable.")
         detail = projection_with_after_tax_estimate(projection, assumptions)
+        if "Year" in detail.columns:
+            detail["Year"] = detail["Year"].astype(int)
         if show_today_dollars:
             detail = add_today_dollar_columns(
                 detail,
                 assumptions,
                 ["Total", "Cash", "Taxable", "Tax-deferred", "Roth", "Gross Withdrawal Need", "Social Security"],
             )
-        money_cols = [
-            "Total", "Cash", "Taxable", "Tax-deferred", "Roth", "Gross Withdrawal Need",
-            "Social Security", "Net Portfolio Withdrawal", "Estimated RMD", "Roth Conversion",
-            "Estimated Roth Tax", "Estimated Total Annual Tax", "Planned Cash Withdrawal",
-            "Planned Taxable Withdrawal", "Planned Tax-deferred Withdrawal", "Planned Roth Withdrawal",
-            "Total Planned Portfolio Withdrawal", "Withdrawal Planning Shortfall",
-            "Total - Today's $", "Cash - Today's $", "Taxable - Today's $", "Tax-deferred - Today's $",
-            "Roth - Today's $", "Gross Withdrawal Need - Today's $", "Social Security - Today's $"
+
+        numeric_detail = detail.copy()
+        arrow_cols = [
+            "Total", "Cash", "Taxable", "Tax-deferred", "Roth",
+            "After-tax Estimate",
+            "Total - Today's $", "Cash - Today's $", "Taxable - Today's $",
+            "Tax-deferred - Today's $", "Roth - Today's $",
         ]
-        for col in money_cols:
-            if col in detail.columns:
-                detail[col] = detail[col].map(lambda x: format_money(float(x)))
+        # Format all money-like fields consistently before rendering.
+        # Keep percentages/status labels as text, and keep Year/Age as integers.
+        money_cols = [
+            "Total", "Cash", "Taxable", "Tax-deferred", "Roth",
+            "After-tax Estimate", "After-tax Tax Drag",
+            "Gross Withdrawal Need", "Social Security", "Net Portfolio Withdrawal",
+            "Estimated RMD", "Roth Conversion", "Estimated Roth Tax",
+            "Estimated Total Annual Tax", "Income Tax", "Capital Gains Tax",
+            "Taxable Brokerage Withdrawal", "Taxable Gain Realized",
+            "ACA MAGI Before Conversion", "ACA MAGI After Conversion",
+            "ACA MAGI Limit", "ACA Headroom After Conversion",
+            "ACA Annual Premium Cost", "ACA Annual OOP Estimate",
+            "ACA Annual Healthcare Cost", "ACA Estimated Subsidy",
+            "Planned Cash Withdrawal", "Planned Taxable Withdrawal",
+            "Planned Tax-deferred Withdrawal", "Planned Roth Withdrawal",
+            "Total Planned Portfolio Withdrawal", "Withdrawal Planning Shortfall",
+            "Purchase Amount", "Purchase Cash Withdrawal", "Purchase Taxable Withdrawal",
+            "Purchase Tax-deferred Withdrawal", "Purchase Roth Withdrawal",
+            "Purchase Taxable Gain", "Purchase Capital Gains Tax",
+            "Purchase Ordinary Income Tax", "Purchase Estimated Tax",
+            "Purchase Shortfall",
+            "Total - Today's $", "Cash - Today's $", "Taxable - Today's $",
+            "Tax-deferred - Today's $", "Roth - Today's $",
+            "Gross Withdrawal Need - Today's $", "Social Security - Today's $",
+        ]
+        # Also catch any new money-like columns that were added after this list was written.
+        money_name_patterns = (
+            "Tax", "Taxable", "MAGI", "Headroom", "Limit", "Withdrawal", "Balance",
+            "Amount", "RMD", "Conversion", "Income", "Need", "Social Security",
+            "Cash", "Roth", "Total", "After-tax", "Purchase", "Shortfall"
+        )
+        for col in detail.columns:
+            if col in {"Year", "Age"} or "Rate" in str(col) or "Bracket" in str(col) or "Status" in str(col) or "Strategy" in str(col) or "Retired" in str(col):
+                continue
+            if col in money_cols or any(pattern in str(col) for pattern in money_name_patterns):
+                try:
+                    if col in arrow_cols and col in numeric_detail.columns:
+                        prior_values = numeric_detail[col].shift(1)
+                        detail[col] = [
+                            format_money_with_direction(cur, None if pd.isna(prev) else float(prev))
+                            if pd.notnull(cur) and str(cur).strip() not in ["", "-", "—", "nan"]
+                            else "—"
+                            for cur, prev in zip(numeric_detail[col], prior_values)
+                        ]
+                    else:
+                        detail[col] = detail[col].apply(
+                            lambda x: format_money(float(x))
+                            if pd.notnull(x) and str(x).strip() not in ["", "-", "—", "nan"]
+                            else "—"
+                        )
+                except Exception:
+                    pass
+
+        if "Year" in detail.columns:
+            detail["Year"] = detail["Year"].astype(int)
+        if "Age" in detail.columns:
+            detail["Age"] = detail["Age"].astype(int)
+        if "ACA FPL Percent" in detail.columns:
+            detail["ACA FPL Percent"] = detail["ACA FPL Percent"].apply(
+                lambda x: f"{float(x):.0f}%" if pd.notnull(x) and str(x).strip() not in ["", "-", "—", "nan"] else "—"
+            )
+
         st.dataframe(detail, use_container_width=True, hide_index=True)
 
     render_withdrawal_planner(projection, assumptions)
@@ -2645,6 +3426,7 @@ def page_balances() -> None:
     if hist.empty:
         editor_df = pd.DataFrame({
             "ID": pd.Series(dtype="Int64"),
+            "Account ID": pd.Series(dtype="Int64"),
             "Account": pd.Series(dtype="object"),
             "Balance": pd.Series(dtype="float"),
             "As-of Date": pd.Series(dtype="datetime64[ns]"),
@@ -2660,6 +3442,7 @@ def page_balances() -> None:
         hide_index=True,
         column_config={
             "ID": st.column_config.NumberColumn("ID", disabled=True),
+            "Account ID": st.column_config.NumberColumn("Account ID", disabled=True, help="Internal account id. Used to preserve the account link if the editor blanks the visible name."),
             "Account": st.column_config.SelectboxColumn("Account", options=account_names, required=True),
             "Balance": st.column_config.NumberColumn("Balance", min_value=0.0, step=100.0, format="$%.2f", required=True),
             "As-of Date": st.column_config.DateColumn("As-of Date", required=True),
@@ -2732,20 +3515,49 @@ def page_accounts() -> None:
 
 def page_contributions() -> None:
     st.title("Contributions")
-    accounts = read_accounts()
-    if accounts.empty:
+
+    # Use all accounts for the inline editor so existing contribution rows do not
+    # appear blank just because an account was marked inactive. The projection
+    # can still decide what to include based on contribution Active flags and
+    # routed cashflow settings.
+    accounts_all = read_accounts(active_only=False)
+    accounts_active = read_accounts(active_only=True)
+
+    if accounts_all.empty:
         st.warning("Add an account first.")
         return
+
+    if accounts_active.empty:
+        st.warning("All accounts are currently inactive. You can still edit existing contribution rows below, but activate an account before adding new contributions.")
 
     if get_assumptions().get("use_routed_cashflow", "1") == "1":
         st.info("Routed cashflow is ON. Cash and taxable/brokerage contribution rows are ignored in the projection to avoid double-counting. 401k/Roth contribution rows are still included.")
 
-    account_names = accounts["name"].tolist()
-    account_name_to_id = dict(zip(accounts["name"], accounts["id"]))
+    # Normalize account names for the Streamlit data editor. Trailing/hidden
+    # whitespace in the DB can make SelectboxColumn treat a visible name as
+    # invalid, which caused edited account names to disappear after refresh.
+    accounts_all = accounts_all.copy()
+    accounts_all["name"] = accounts_all["name"].astype(str).str.strip()
+    accounts_active = accounts_active.copy()
+    if not accounts_active.empty:
+        accounts_active["name"] = accounts_active["name"].astype(str).str.strip()
+
+    account_names_all = sorted([x for x in accounts_all["name"].dropna().tolist() if str(x).strip()])
+    account_name_to_id = {
+        str(row["name"]).strip(): int(row["id"])
+        for _, row in accounts_all.iterrows()
+        if str(row.get("name", "")).strip()
+    }
+    account_id_to_name = {
+        int(row["id"]): str(row["name"]).strip()
+        for _, row in accounts_all.iterrows()
+        if str(row.get("name", "")).strip()
+    }
 
     st.subheader("Add quick planned contribution")
     with st.form("add_contribution"):
-        account_id = account_select(accounts, "Account", "contribution_account")
+        quick_accounts = accounts_active if not accounts_active.empty else accounts_all
+        account_id = account_select(quick_accounts, "Account", "contribution_account")
         amount = st.number_input("Amount per contribution", min_value=0.0, step=100.0, format="%.2f")
         frequency = st.selectbox("Frequency", ["Monthly", "Semi-monthly", "Biweekly", "Annual", "One-time"])
         start = st.date_input("Start date", value=date.today())
@@ -2763,6 +3575,7 @@ def page_contributions() -> None:
     if contribs_all.empty:
         editor_df = pd.DataFrame({
             "ID": pd.Series(dtype="Int64"),
+            "Account ID": pd.Series(dtype="Int64"),
             "Account": pd.Series(dtype="object"),
             "Amount": pd.Series(dtype="float"),
             "Frequency": pd.Series(dtype="object"),
@@ -2775,6 +3588,7 @@ def page_contributions() -> None:
         editor_df = contribs_all.rename(
             columns={
                 "id": "ID",
+                "account_id": "Account ID",
                 "name": "Account",
                 "amount": "Amount",
                 "frequency": "Frequency",
@@ -2785,7 +3599,18 @@ def page_contributions() -> None:
             }
         )
         editor_df["Active"] = editor_df["Active"].astype(bool)
-        editor_df = editor_df[["ID", "Account", "Amount", "Frequency", "Start Date", "End Date", "Notes", "Active"]]
+        editor_df["Account ID"] = pd.to_numeric(editor_df["Account ID"], errors="coerce").astype("Int64")
+        editor_df["Account"] = editor_df.apply(
+            lambda r: account_id_to_name.get(int(r["Account ID"]), str(r.get("Account", "")).strip())
+            if pd.notna(r.get("Account ID")) else str(r.get("Account", "")).strip(),
+            axis=1,
+        )
+        editor_df = editor_df[["ID", "Account ID", "Account", "Amount", "Frequency", "Start Date", "End Date", "Notes", "Active"]]
+        missing_rows = editor_df["Account"].astype(str).str.startswith("[Missing account #") | (editor_df["Account"].astype(str).str.strip() == "")
+        if missing_rows.any():
+            st.warning(
+                "Some contribution rows point to a deleted or blank account. Use the Account dropdown to select the correct account, then save."
+            )
 
     edited = st.data_editor(
         editor_df,
@@ -2794,7 +3619,7 @@ def page_contributions() -> None:
         hide_index=True,
         column_config={
             "ID": st.column_config.NumberColumn("ID", disabled=True),
-            "Account": st.column_config.SelectboxColumn("Account", options=account_names, required=True),
+            "Account": st.column_config.SelectboxColumn("Account", options=account_names_all, required=True, help="Uses all accounts, including inactive accounts. Account ID is also preserved as a fallback when saving."),
             "Amount": st.column_config.NumberColumn("Amount", min_value=0.0, step=100.0, format="$%.2f", required=True),
             "Frequency": st.column_config.SelectboxColumn("Frequency", options=["Monthly", "Semi-monthly", "Biweekly", "Annual", "One-time"], required=True),
             "Start Date": st.column_config.DateColumn("Start Date", required=True),
@@ -2808,9 +3633,12 @@ def page_contributions() -> None:
     c1, c2 = st.columns([1, 4])
     with c1:
         if st.button("Save contribution edits", type="primary"):
-            save_contribution_editor(edited, account_name_to_id)
-            st.success("Contributions updated.")
-            st.rerun()
+            try:
+                save_contribution_editor(edited, account_name_to_id)
+                st.success("Contributions updated.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
     with c2:
         st.caption("Uncheck Active instead of deleting if you want to keep an old contribution in history.")
 
@@ -2881,7 +3709,180 @@ def page_roth_conversions() -> None:
                 st.success("Tax assumptions saved.")
                 st.rerun()
 
-    st.subheader("Scenario editor")
+    with st.expander("ACA optimization assumptions", expanded=False):
+        st.info(
+            "ACA optimization is usually relevant from retirement until Medicare. "
+            "By default, ACA start age follows Retirement Age and ACA end age is the year before Medicare."
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            aca_fpl = st.number_input(
+                "100% FPL amount",
+                value=float(assumptions.get("aca_fpl_100", 21150)),
+                step=100.0,
+                help="Federal Poverty Level amount for your ACA household size. Update annually."
+            )
+        with c2:
+            aca_target_pct = st.number_input(
+                "ACA target % FPL",
+                value=float(assumptions.get("aca_target_fpl_percent", 400)),
+                step=10.0,
+                help="Example: 400 means target ACA MAGI near 400% of FPL. Lower targets may increase subsidies but reduce Roth conversion room."
+            )
+        with c3:
+            aca_buffer = st.number_input(
+                "ACA MAGI safety buffer",
+                value=float(assumptions.get("aca_magi_safety_buffer", 1000)),
+                step=100.0,
+                help="Subtracts a cushion from the ACA MAGI limit so the model does not aim exactly at the cliff/target."
+            )
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            medicare_age = st.number_input(
+                "Medicare age",
+                value=int(float(assumptions.get("aca_medicare_age", 65))),
+                step=1,
+                help="ACA optimization normally ends the year before this age."
+            )
+        with c5:
+            st.metric("ACA start age", aca_start_age(assumptions), help="Defaults to Retirement Age.")
+        with c6:
+            st.metric("ACA end age", aca_end_age(assumptions), help="Defaults to the year before Medicare.")
+        st.caption(
+            f"Current ACA MAGI target: {format_money(aca_magi_limit_value := max(aca_fpl * (aca_target_pct / 100.0) - aca_buffer, 0.0))}."
+        )
+        if st.button("Save ACA assumptions"):
+            set_assumption("aca_fpl_100", str(aca_fpl))
+            set_assumption("aca_target_fpl_percent", str(aca_target_pct))
+            set_assumption("aca_magi_safety_buffer", str(aca_buffer))
+            set_assumption("aca_medicare_age", str(medicare_age))
+            set_assumption("aca_start_age", "auto")
+            set_assumption("aca_end_age", "auto")
+            st.success("ACA assumptions saved.")
+            st.rerun()
+
+    st.subheader("How much should I convert each year?")
+    st.caption(
+        "Use this section as the yearly instruction table. For the ACA optimizer, "
+        "the app calculates the Roth conversion amount that stays under the ACA MAGI target during ACA years."
+    )
+
+    active_conversion_scenarios = read_roth_scenarios(active_only=True)
+    if not active_conversion_scenarios.empty:
+        # Prefer the ACA optimizer scenario by default. Existing databases may have
+        # several older scenarios, so do not default to the first row.
+        names_for_plan = active_conversion_scenarios["name"].tolist()
+        default_idx = 0
+        for i, row_s in active_conversion_scenarios.iterrows():
+            if str(row_s.get("strategy", "")).strip() == "Optimize ACA" or "ACA" in str(row_s.get("name", "")).upper():
+                default_idx = names_for_plan.index(row_s["name"])
+                break
+
+        selected_conversion_plan = st.selectbox(
+            "Conversion guidance scenario",
+            names_for_plan,
+            index=default_idx,
+            key="aca_conversion_guidance_scenario",
+            help="Choose 'Optimize ACA' to see the year-by-year Roth conversion amount that stays under the ACA MAGI target."
+        )
+        guidance_scenario = active_conversion_scenarios.loc[
+            active_conversion_scenarios["name"] == selected_conversion_plan
+        ].iloc[0].to_dict()
+
+        if str(guidance_scenario.get("strategy", "")) != "Optimize ACA":
+            st.info(
+                "This selected scenario is not the ACA optimizer. It will still show year-by-year conversions, "
+                "but it may not adjust conversions to stay below the ACA MAGI target. Select 'Optimize ACA' for ACA subsidy planning."
+            )
+
+        guidance_years = int(float(assumptions.get("years_to_project", 35)))
+        guidance_projection = build_projection(guidance_years, assumptions, roth_scenario=guidance_scenario)
+
+        current_age_value = int(float(assumptions.get("current_age", 50)))
+        default_planning_age = max(current_age_value, aca_start_age(assumptions))
+        if default_planning_age > int(guidance_projection["Age"].max()):
+            default_planning_age = int(guidance_projection["Age"].iloc[0])
+
+        available_ages = guidance_projection["Age"].astype(int).tolist()
+        default_age_idx = available_ages.index(default_planning_age) if default_planning_age in available_ages else 0
+
+        selected_planning_age = st.selectbox(
+            "Planning age / year",
+            available_ages,
+            index=default_age_idx,
+            key="aca_conversion_guidance_age",
+            help="Pick the age/year you want the app to answer: 'How much should I convert this year?'"
+        )
+
+        row = guidance_projection[guidance_projection["Age"].astype(int) == int(selected_planning_age)].iloc[0]
+        calendar_year = int(row.get("Year", date.today().year))
+        projection_year = calendar_year - date.today().year
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            f"Convert at age {int(selected_planning_age)}",
+            format_money(float(row.get("Roth Conversion", 0.0))),
+            help=f"Projection year {projection_year}, approximately calendar year {calendar_year}."
+        )
+        m2.metric(
+            "Approx. calendar year",
+            str(calendar_year),
+            help="Calculated from the current calendar year plus the projection year."
+        )
+        m3.metric(
+            "ACA MAGI after conversion",
+            format_money(float(row.get("ACA MAGI After Conversion", 0.0))),
+            help="Estimated ACA MAGI after the modeled Roth conversion."
+        )
+        m4.metric(
+            "ACA headroom",
+            format_money(float(row.get("ACA Headroom After Conversion", 0.0))),
+            help="Remaining room below the ACA MAGI target after the modeled conversion."
+        )
+
+        if aca_start_age(assumptions) <= int(selected_planning_age) <= aca_end_age(assumptions):
+            st.success(
+                f"ACA optimization is active at age {int(selected_planning_age)}. "
+                f"The suggested conversion is {format_money(float(row.get('Roth Conversion', 0.0)))}."
+            )
+        else:
+            st.caption(
+                f"Age {int(selected_planning_age)} is outside the ACA optimization window "
+                f"({aca_start_age(assumptions)}–{aca_end_age(assumptions)})."
+            )
+
+        guidance_cols = [
+            "Year", "Age", "Roth Conversion", "Estimated Roth Tax",
+            "ACA MAGI Before Conversion", "ACA MAGI After Conversion",
+            "ACA MAGI Limit", "ACA Headroom After Conversion", "ACA Status"
+        ]
+        guidance_display = guidance_projection[[c for c in guidance_cols if c in guidance_projection.columns]].copy()
+        if "Year" in guidance_display.columns:
+            guidance_display["Year"] = guidance_display["Year"].astype(int)
+
+        for col in [c for c in guidance_display.columns if c not in {"Year", "Age", "Approx. Calendar Year", "ACA Status"}]:
+            guidance_display[col] = guidance_display[col].apply(
+                lambda x: format_money(float(x))
+                if pd.notnull(x) and str(x).strip() not in ["", "-", "—", "nan"]
+                else "—"
+            )
+
+        st.dataframe(
+            guidance_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Year": st.column_config.NumberColumn("Calendar Year", help="Projected calendar year."),
+                "Age": st.column_config.NumberColumn("Age", help="Your projected age in that row."),
+                "Roth Conversion": st.column_config.TextColumn("Roth Conversion", help="The modeled amount to convert to Roth that year."),
+                "ACA MAGI Before Conversion": st.column_config.TextColumn("ACA MAGI Before Conversion", help="Estimated ACA MAGI before the Roth conversion."),
+                "ACA MAGI After Conversion": st.column_config.TextColumn("ACA MAGI After Conversion", help="Estimated ACA MAGI after the Roth conversion."),
+                "ACA MAGI Limit": st.column_config.TextColumn("ACA MAGI Limit", help="Editable ACA MAGI target based on FPL target minus safety buffer."),
+                "ACA Headroom After Conversion": st.column_config.TextColumn("ACA Headroom After Conversion", help="Remaining room under the ACA target after conversion."),
+                "ACA Status": st.column_config.TextColumn("ACA Status", help="Whether the row is under/over the ACA MAGI target or outside ACA years."),
+            },
+        )
+
     st.caption("For Fixed annual amount scenarios, edit Annual Amount to test any yearly conversion amount. Target Bracket is intentionally N/A for fixed and no-conversion rows; bracket reached is reported later as an outcome metric.")
     scenarios = read_roth_scenarios(active_only=False)
     if scenarios.empty:
@@ -2926,7 +3927,7 @@ def page_roth_conversions() -> None:
             "Name": st.column_config.TextColumn("Name", required=True, help="Scenario label shown in charts and comparisons."),
             "Start Age": st.column_config.NumberColumn("Start Age", min_value=0, max_value=120, step=1, required=True, help="First age when this conversion strategy is allowed to run."),
             "End Age": st.column_config.NumberColumn("End Age", min_value=0, max_value=120, step=1, required=True, help="Last age when this conversion strategy is allowed to run. Social Security no longer hard-stops conversions; instead, SS income reduces bracket-fill room after SS begins."),
-            "Strategy": st.column_config.SelectboxColumn("Strategy", options=["No conversions", "Fixed annual amount", "Fill bracket"], required=True, help="No conversions is the baseline. Fixed annual amount uses Annual Amount. Fill bracket converts enough to reach Target Bracket after Other Taxable Income and the standard deduction."),
+            "Strategy": st.column_config.SelectboxColumn("Strategy", options=["No conversions", "Fixed annual amount", "Fill bracket", "Optimize ACA", "Hybrid ACA"], required=True, help="No conversions is the baseline. Fixed annual amount uses Annual Amount. Fill bracket targets a tax bracket. Optimize ACA adjusts the Roth conversion amount year by year to stay under the ACA MAGI target during ACA years."),
             "Annual Amount": st.column_config.NumberColumn("Annual Amount", min_value=0.0, step=5000.0, format="$%.2f", help="Configurable amount used only for Fixed annual amount scenarios. Change this from $80,000 to any annual conversion amount you want to test. The app will not convert more than the remaining tax-deferred balance."),
             "Target Bracket": st.column_config.SelectboxColumn("Target Bracket", options=["N/A", "10%", "12%", "22%", "24%", "32%", "35%"], help="Used only for Fill bracket scenarios. Fixed annual amount and No conversions rows should show N/A because they do not target a bracket."),
             "Pay Tax From": st.column_config.SelectboxColumn("Pay Tax From", options=["Cash then Taxable", "Taxable then Cash", "Cash only", "Taxable only", "Withhold from conversion"], help="Where conversion-tax cash is drawn from. Withhold from conversion means the tax comes out of the converted IRA dollars, so less lands in Roth."),
@@ -2943,14 +3944,78 @@ def page_roth_conversions() -> None:
         st.rerun()
 
     st.subheader("Scenario comparison")
+
+    with st.expander("Lifetime comparison settings", expanded=False):
+        st.caption(
+            "Set the lifetime comparison horizon here. ACA premium assumptions now live on the ACA Planner tab. "
+            "This table compares cumulative taxes, estimated healthcare costs, and after-tax value through the selected age."
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            new_compare_age = st.number_input(
+                "Compare through age",
+                min_value=int(float(assumptions.get("current_age", 50))),
+                max_value=120,
+                value=comparison_through_age(assumptions),
+                step=1,
+                help="Cumulative tax/healthcare metrics are summed through this age."
+            )
+        with c2:
+            new_aca_subsidized = st.number_input(
+                "Estimated annual ACA premium if under target",
+                min_value=0.0,
+                value=float(assumptions.get("aca_subsidized_annual_premium", 6000)),
+                step=500.0,
+                help="Planning estimate for annual ACA premiums when MAGI stays under the target."
+            )
+        with c3:
+            new_aca_full = st.number_input(
+                "Estimated annual ACA premium if over target",
+                min_value=0.0,
+                value=float(assumptions.get("aca_full_annual_premium", 18000)),
+                step=500.0,
+                help="Planning estimate for annual ACA premiums when MAGI exceeds the target."
+            )
+        c4, c5 = st.columns(2)
+        with c4:
+            new_irmaa_threshold = st.number_input(
+                "IRMAA MAGI threshold estimate",
+                min_value=0.0,
+                value=float(assumptions.get("irmaa_magi_threshold", 206000)),
+                step=1000.0,
+                help="Simplified MAGI threshold used to estimate Medicare IRMAA risk."
+            )
+        with c5:
+            new_irmaa_surcharge = st.number_input(
+                "Estimated annual IRMAA surcharge",
+                min_value=0.0,
+                value=float(assumptions.get("irmaa_annual_surcharge", 0)),
+                step=100.0,
+                help="Simplified annual surcharge added in Medicare years when MAGI exceeds the threshold."
+            )
+        if st.button("Save lifetime comparison settings"):
+            set_assumption("lifetime_comparison_age", str(int(new_compare_age)))
+            set_assumption("aca_subsidized_annual_premium", str(float(new_aca_subsidized)))
+            set_assumption("aca_full_annual_premium", str(float(new_aca_full)))
+            set_assumption("irmaa_magi_threshold", str(float(new_irmaa_threshold)))
+            set_assumption("irmaa_annual_surcharge", str(float(new_irmaa_surcharge)))
+            st.success("Lifetime comparison settings saved.")
+            st.rerun()
+
     dashboard_scenario, dashboard_plan_name, _active_roth_scenarios = get_dashboard_roth_scenario(assumptions)
     render_roth_window_callout(assumptions, dashboard_scenario, dashboard_plan_name)
+    current_age_for_compare = int(float(assumptions.get("current_age", 50)))
+    compare_years_default = max(
+        35,
+        comparison_through_age(assumptions) - current_age_for_compare,
+        int(float(assumptions.get("years_to_project", 20))),
+    )
     years = st.slider(
-        "Years to compare",
+        "Years to project in comparison",
         5,
-        45,
-        max(35, int(float(assumptions.get("years_to_project", 20)))),
-        help="Longer windows are better for Roth analysis because the benefit is mostly from reducing future tax-deferred balances and future taxes.",
+        60,
+        compare_years_default,
+        help="Make this long enough to reach the comparison age. Longer windows are better for Roth, RMD, ACA, and IRMAA analysis.",
     )
     comparison = build_roth_scenario_comparison(years, assumptions)
     if comparison.empty:
@@ -2971,6 +4036,14 @@ def page_roth_conversions() -> None:
         "Total Converted",
         "Conversion Tax Paid",
         "Cumulative Tax Savings at End",
+        "Lifetime Estimated Tax",
+        "Estimated ACA Premium Cost",
+        "Estimated IRMAA Cost",
+        "Total Tax + Healthcare Cost",
+        "Cumulative RMDs",
+        "Tax-deferred at Comparison Age",
+        "Roth at Comparison Age",
+        "After-tax Value at Comparison Age",
         "Ending Tax-deferred",
         "Ending Roth",
         "After-tax Ending Estimate",
@@ -2985,6 +4058,14 @@ def page_roth_conversions() -> None:
         "After-tax Ending Estimate",
         "After-tax Gain vs Baseline",
         "Cumulative Tax Savings at End",
+        "Lifetime Estimated Tax",
+        "Estimated ACA Premium Cost",
+        "Estimated IRMAA Cost",
+        "Total Tax + Healthcare Cost",
+        "Cumulative RMDs",
+        "Tax-deferred at Comparison Age",
+        "Roth at Comparison Age",
+        "After-tax Value at Comparison Age",
     ]:
         display[col] = display[col].map(lambda x: format_money(float(x)))
 
@@ -2997,15 +4078,31 @@ def page_roth_conversions() -> None:
         "Total Converted": st.column_config.TextColumn("Total Converted", help="Total pre-tax retirement dollars moved from Tax-deferred into Roth during the scenario window."),
         "Conversion Tax Paid": st.column_config.TextColumn("Conversion Tax Paid", help="Cumulative estimated federal tax generated by the Roth conversions. This is the upfront tax cost that future tax savings need to recover."),
         "Cumulative Tax Savings at End": st.column_config.TextColumn("Cumulative Tax Savings at End", help="Baseline cumulative estimated taxes minus this scenario's cumulative estimated taxes at the end of the comparison window. Positive means the scenario has produced net lifetime tax savings by then."),
+        "Lifetime Estimated Tax": st.column_config.TextColumn("Lifetime Estimated Tax", help="Sum of estimated annual taxes through the configurable comparison age."),
+        "Estimated ACA Premium Cost": st.column_config.TextColumn("Estimated ACA Premium Cost", help="Editable estimate of ACA premiums through the ACA window. Uses the subsidized estimate when MAGI is under target and full estimate when over target."),
+        "Estimated IRMAA Cost": st.column_config.TextColumn("Estimated IRMAA Cost", help="Simplified Medicare IRMAA estimate after Medicare age when MAGI exceeds the editable threshold."),
+        "Total Tax + Healthcare Cost": st.column_config.TextColumn("Total Tax + Healthcare Cost", help="Lifetime estimated tax plus estimated ACA premiums plus estimated IRMAA costs through the comparison age. Lower is better, all else equal."),
+        "Cumulative RMDs": st.column_config.TextColumn("Cumulative RMDs", help="Estimated total forced RMDs through the comparison age. This shows future pre-tax pressure."),
+        "Tax-deferred at Comparison Age": st.column_config.TextColumn("Tax-deferred at Comparison Age", help="Traditional/401k/IRA-style balance remaining at the configured comparison age."),
+        "Roth at Comparison Age": st.column_config.TextColumn("Roth at Comparison Age", help="Roth balance at the configured comparison age."),
+        "After-tax Value at Comparison Age": st.column_config.TextColumn("After-tax Value at Comparison Age", help="After-tax balance-sheet estimate at the configured comparison age."),
         "Ending Tax-deferred": st.column_config.TextColumn("Ending Tax-deferred", help="Projected ending balance still in traditional/401k/IRA-style tax-deferred accounts. Higher values imply more future taxable withdrawals/RMD exposure."),
         "Ending Roth": st.column_config.TextColumn("Ending Roth", help="Projected ending Roth balance. Roth dollars are treated as after-tax in this simplified model."),
         "After-tax Ending Estimate": st.column_config.TextColumn("After-tax Ending Estimate", help="Projected ending total minus the editable future-tax-rate estimate applied to remaining tax-deferred balances. This is a balance-sheet estimate, separate from the break-even tax-payback metric."),
         "After-tax Gain vs Baseline": st.column_config.TextColumn("After-tax Gain vs Baseline", help="Ending after-tax estimate minus the no-conversion scenario's ending after-tax estimate."),
     }
     st.dataframe(display, use_container_width=True, hide_index=True, column_config=comparison_column_config)
+    if "Total Tax + Healthcare Cost" in comparison.columns:
+        best_idx = comparison["Total Tax + Healthcare Cost"].astype(float).idxmin()
+        best_row = comparison.loc[best_idx]
+        st.success(
+            f"Lowest estimated tax + healthcare cost through age {comparison_through_age(assumptions)}: "
+            f"{best_row['Scenario']} at {format_money(float(best_row['Total Tax + Healthcare Cost']))}."
+        )
     st.caption(
-        "Break-even Age is based on cumulative estimated taxes: upfront Roth conversion taxes versus later estimated tax savings from lower tax-deferred/RMD exposure. "
-        "After-tax Ending Estimate is a separate balance-sheet estimate and should be treated as directional, not tax advice."
+        "Break-even Age is based on cumulative estimated taxes. Total Tax + Healthcare Cost adds editable ACA premium and IRMAA estimates, "
+        "so it is useful for comparing ACA subsidy preservation against more aggressive Roth conversions. "
+        "All healthcare/tax numbers are planning estimates, not tax advice."
     )
 
     with st.expander("Column definitions", expanded=False):
@@ -3034,7 +4131,38 @@ def page_roth_conversions() -> None:
         names = active_scenarios["name"].tolist()
         selected = st.selectbox("Scenario", names)
         scenario = active_scenarios.loc[active_scenarios["name"] == selected].iloc[0].to_dict()
-        proj = projection_with_after_tax_estimate(build_projection(years, assumptions, roth_scenario=scenario), assumptions)
+
+        active_detail_purchases = read_planned_purchases(active_only=True)
+        saved_purchase_chart_default = assumptions.get("show_purchase_impact_on_dashboard_chart", "1") == "1"
+        include_detail_purchases = True
+        if not active_detail_purchases.empty:
+            include_detail_purchases = st.checkbox(
+                "Include active planned purchases in this detailed scenario chart and Roth conversion chart",
+                value=saved_purchase_chart_default,
+                help=(
+                    "When checked, active purchases reduce the projected buckets and can change Roth conversions, "
+                    "withdrawals, ACA MAGI, taxes, and future balances. When unchecked, this detailed scenario area "
+                    "shows the same plan without those purchase impacts."
+                ),
+                key="detail_include_purchase_impacts",
+            )
+        else:
+            st.caption("No active planned purchases are currently available to include in this detailed scenario view.")
+
+        proj = projection_with_after_tax_estimate(
+            build_projection(
+                years,
+                assumptions,
+                roth_scenario=scenario,
+                ignore_purchases=not include_detail_purchases,
+            ),
+            assumptions,
+        )
+        if not active_detail_purchases.empty:
+            if include_detail_purchases:
+                st.caption("Active planned purchases are included in the detailed balance chart, Roth conversion chart, and table below.")
+            else:
+                st.caption("Active planned purchases are hidden here, so the detailed balance chart, Roth conversion chart, and table below show the plan without purchase impacts.")
         fig2 = go.Figure()
         for col in ["Cash", "Taxable", "Tax-deferred", "Roth"]:
             if col in proj.columns and proj[col].sum() > 0:
@@ -3069,6 +4197,10 @@ def page_roth_conversions() -> None:
 
         details = proj.copy()
         numeric_details = proj.copy()
+        arrow_cols = [
+            "Total", "Cash", "Taxable", "Tax-deferred", "Roth",
+            "After-tax Estimate",
+        ]
 
         rmd_start_age = int(float(assumptions.get("rmd_start_age", 73)))
 
@@ -3103,10 +4235,53 @@ def page_roth_conversions() -> None:
             "Purchase Ordinary Income Tax",
             "Purchase Estimated Tax",
             "Purchase Shortfall",
+            "ACA MAGI Before Conversion",
+            "ACA MAGI After Conversion",
+            "ACA MAGI Limit",
+            "ACA Headroom After Conversion",
         ]
         for col in standard_money_cols:
             if col in details.columns:
-                details[col] = details[col].map(lambda x: format_money(float(x)))
+                if col in arrow_cols and col in numeric_details.columns:
+                    prior_values = numeric_details[col].shift(1)
+                    details[col] = [
+                        format_money_with_direction(cur, None if pd.isna(prev) else float(prev))
+                        if pd.notnull(cur) and str(cur).strip() not in ["", "-", "—", "nan"]
+                        else "—"
+                        for cur, prev in zip(numeric_details[col], prior_values)
+                    ]
+                else:
+                    details[col] = details[col].apply(
+                        lambda x: format_money(float(x))
+                        if pd.notnull(x) and str(x).strip() not in ["", "-", "—", "nan"]
+                        else "—"
+                    )
+
+        # Also catch new money-like columns not explicitly listed above.
+        money_name_patterns = (
+            "Tax", "Taxable", "MAGI", "Headroom", "Limit", "Withdrawal", "Balance",
+            "Amount", "RMD", "Conversion", "Income", "Need", "Social Security",
+            "Cash", "Roth", "Total", "After-tax", "Purchase", "Shortfall"
+        )
+        for col in details.columns:
+            if col in arrow_cols:
+                continue
+            if col in {"Year", "Age"} or "Rate" in str(col) or "Bracket" in str(col) or "Status" in str(col) or "Strategy" in str(col) or "Retired" in str(col):
+                continue
+            if col in standard_money_cols or any(pattern in str(col) for pattern in money_name_patterns):
+                try:
+                    details[col] = details[col].apply(
+                        lambda x: format_money(float(x))
+                        if pd.notnull(x) and str(x).strip() not in ["", "-", "—", "nan"]
+                        else "—"
+                    )
+                except Exception:
+                    pass
+
+        if "Year" in details.columns:
+            details["Year"] = details["Year"].astype(int)
+        if "Age" in details.columns:
+            details["Age"] = details["Age"].astype(int)
 
         # Make zero-heavy diagnostic columns easier to read.
         # A dash means "not applicable yet" rather than an actual modeled $0 event.
@@ -3378,6 +4553,137 @@ def purchase_strategy_display_name(strategy: str) -> str:
     return text
 
 
+def best_practical_purchase_candidate_label(
+    purchase: dict,
+    purchase_age: int,
+    assumptions: Dict[str, str],
+    roth_scenario: dict | None,
+    years: int,
+) -> str:
+    """Choose the practical dashboard funding candidate for a purchase age.
+
+    During ACA years, prefer fully funded ACA-safe candidates. After ACA years,
+    prefer tax-deferred funding when fully funded because it may reduce future
+    RMD pressure and the ACA cliff is gone. Otherwise fall back to the strongest
+    after-tax ending value among fully funded candidates.
+    """
+    purchase_age = int(purchase_age)
+    test_is_aca_year = aca_start_age(assumptions) <= purchase_age <= aca_end_age(assumptions)
+
+    baseline = projection_with_after_tax_estimate(
+        build_projection(years, assumptions, roth_scenario=roth_scenario, ignore_purchases=True),
+        assumptions,
+    )
+    base_end = baseline.iloc[-1]
+    base_age_rows = baseline[baseline["Age"].astype(int) == purchase_age]
+    base_age_row = base_age_rows.iloc[0] if not base_age_rows.empty else base_end
+    base_aca_cost = float(base_age_row.get("ACA Annual Healthcare Cost", 0.0) or 0.0)
+
+    rows = []
+    for label, strategy, _note in purchase_optimizer_candidate_strategies():
+        tmp = pd.DataFrame([{
+            "name": purchase.get("name", "Purchase"),
+            "purchase_age": purchase_age,
+            "amount": float(purchase.get("amount", 0.0) or 0.0),
+            "funding_strategy": strategy,
+            "include_in_projection": 1,
+            "notes": purchase.get("notes", ""),
+        }])
+        proj = projection_with_after_tax_estimate(
+            build_projection(years, assumptions, roth_scenario=roth_scenario, purchases_override=tmp),
+            assumptions,
+        )
+        end = proj.iloc[-1]
+        purchase_year_rows = proj[proj["Age"].astype(int) == purchase_age]
+        pr = purchase_year_rows.iloc[0] if not purchase_year_rows.empty else end
+
+        aca_status = str(pr.get("ACA Status", "Not ACA year"))
+        aca_cost_status = str(pr.get("ACA Cost Status", "Not ACA year"))
+        aca_healthcare_cost = float(pr.get("ACA Annual Healthcare Cost", 0.0) or 0.0)
+        aca_cost_change = aca_healthcare_cost - base_aca_cost
+        aca_over_target = test_is_aca_year and (
+            aca_status != "Under target"
+            or "Over" in aca_cost_status
+            or "cliff" in aca_cost_status.lower()
+        )
+
+        rows.append({
+            "Candidate": label,
+            "Shortfall": float(pr.get("Purchase Shortfall", 0.0) or 0.0),
+            "ACA Safe?": "No" if aca_over_target else "Yes",
+            "ACA Cost Change": aca_cost_change,
+            "After-tax Ending Impact": float(end.get("After-tax Estimate", 0.0) or 0.0) - float(base_end.get("After-tax Estimate", 0.0) or 0.0),
+        })
+
+    candidates = pd.DataFrame(rows)
+    if candidates.empty:
+        return "Saved purchase strategy"
+
+    fully_funded = candidates[candidates["Shortfall"].astype(float) <= 0.0].copy()
+    if fully_funded.empty:
+        return "Saved purchase strategy"
+
+    if test_is_aca_year:
+        safe = fully_funded[fully_funded["ACA Safe?"] == "Yes"].copy()
+        if not safe.empty:
+            return str(safe.sort_values(["ACA Cost Change", "After-tax Ending Impact"], ascending=[True, False]).iloc[0]["Candidate"])
+        return str(fully_funded.sort_values(["ACA Cost Change", "After-tax Ending Impact"], ascending=[True, False]).iloc[0]["Candidate"])
+
+    if purchase_age > aca_end_age(assumptions):
+        td = fully_funded[fully_funded["Candidate"] == "Tax-deferred only"]
+        if not td.empty:
+            return "Tax-deferred only"
+
+    return str(fully_funded.sort_values(["After-tax Ending Impact"], ascending=[False]).iloc[0]["Candidate"])
+
+
+def dashboard_purchase_rows_with_override(
+    purchases: pd.DataFrame,
+    override_label: str,
+    assumptions: Dict[str, str] | None = None,
+    roth_scenario: dict | None = None,
+    years: int = 35,
+    age_override: int | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """Apply dashboard-only purchase age/funding overrides.
+
+    The Purchase Planner keeps the saved/default strategy. Dashboard controls
+    let you test a different purchase age and funding candidate without editing
+    the saved purchase row.
+    """
+    if purchases is None or purchases.empty:
+        return pd.DataFrame(), ""
+
+    out = purchases.copy()
+    if age_override is not None:
+        out["purchase_age"] = int(age_override)
+
+    override_label = str(override_label or "Auto practical candidate")
+    effective_label = override_label
+
+    if override_label == "Auto practical candidate":
+        labels = []
+        if assumptions is not None:
+            for idx, row in out.iterrows():
+                label = best_practical_purchase_candidate_label(
+                    row.to_dict(),
+                    int(row.get("purchase_age", 0)),
+                    assumptions,
+                    roth_scenario,
+                    years,
+                )
+                out.at[idx, "funding_strategy"] = candidate_label_to_strategy(label)
+                labels.append(label)
+        effective_label = ", ".join(sorted(set(labels))) if labels else "Auto practical candidate"
+    elif override_label != "Saved purchase strategy":
+        out["funding_strategy"] = candidate_label_to_strategy(override_label)
+        effective_label = override_label
+    else:
+        effective_label = "Saved purchase strategy"
+
+    return out, effective_label
+
+
 def estimate_rmd_at_age_from_projection(projection: pd.DataFrame, age: int) -> float:
     rows = projection[projection["Age"].astype(int) == int(age)]
     if rows.empty:
@@ -3501,6 +4807,20 @@ def page_purchase_planner() -> None:
     purchase_names = purchases["name"].tolist()
     selected_name = st.selectbox("Purchase to compare", purchase_names)
     selected_purchase = purchases.loc[purchases["name"] == selected_name].iloc[0].to_dict()
+    purchase_age = int(selected_purchase["purchase_age"])
+    purchase_is_aca_year = aca_start_age(assumptions) <= purchase_age <= aca_end_age(assumptions)
+    if purchase_is_aca_year:
+        st.warning(
+            f"This purchase occurs at age {purchase_age}, inside the ACA window "
+            f"({aca_start_age(assumptions)}–{aca_end_age(assumptions)}). "
+            "Funding with tax-deferred dollars can create ordinary income and may push MAGI over the ACA target/cliff. "
+            "The optimizer now prioritizes ACA-safe candidates before maximizing after-tax ending value."
+        )
+    else:
+        st.info(
+            f"This purchase occurs at age {purchase_age}, outside the modeled ACA window "
+            f"({aca_start_age(assumptions)}–{aca_end_age(assumptions)}). ACA subsidy preservation is less important for this purchase age."
+        )
 
     comparison_rows = []
     for strategy in PURCHASE_FUNDING_STRATEGIES:
@@ -3522,6 +4842,11 @@ def page_purchase_planner() -> None:
             "Purchase Amount": float(selected_purchase["amount"]),
             "Purchase Tax": float(pr.get("Purchase Estimated Tax", 0.0)),
             "Purchase Shortfall": float(pr.get("Purchase Shortfall", 0.0)),
+            "ACA MAGI After Purchase": float(pr.get("ACA MAGI After Conversion", 0.0)),
+            "ACA Headroom After Purchase": float(pr.get("ACA Headroom After Conversion", 0.0)),
+            "ACA Healthcare Cost": float(pr.get("ACA Annual Healthcare Cost", 0.0)),
+            "ACA Status": str(pr.get("ACA Status", "Not ACA year")),
+            "ACA Cost Status": str(pr.get("ACA Cost Status", "Not ACA year")),
             "Ending Total": float(end["Total"]),
             "After-tax Ending Estimate": float(end["After-tax Estimate"]),
             "Cumulative Estimated Tax": float(end.get("Cumulative Estimated Tax", 0.0)),
@@ -3534,7 +4859,7 @@ def page_purchase_planner() -> None:
     if not comp.empty:
         best_after_tax = comp["After-tax Ending Estimate"].max()
         comp["After-tax Difference vs Best"] = comp["After-tax Ending Estimate"] - best_after_tax
-        money_cols = [c for c in comp.columns if c not in {"Funding Strategy", "Purchase Age"}]
+        money_cols = [c for c in comp.columns if c not in {"Funding Strategy", "Purchase Age", "ACA Status", "ACA Cost Status"}]
         display = comp.copy()
         if "Funding Strategy" in display.columns:
             display["Funding Strategy"] = display["Funding Strategy"].map(purchase_strategy_display_name)
@@ -3567,7 +4892,9 @@ def page_purchase_planner() -> None:
     purchase_age = int(selected_purchase["purchase_age"])
     rmd_check_age = max(75, int(float(assumptions.get("rmd_start_age", 73))) + 2)
     base_purchase_age_rows = baseline_no_purchase[baseline_no_purchase["Age"].astype(int) == purchase_age]
-    base_purchase_cum_tax = float(base_purchase_age_rows.iloc[0].get("Cumulative Estimated Tax", 0.0)) if not base_purchase_age_rows.empty else 0.0
+    base_purchase_row = base_purchase_age_rows.iloc[0] if not base_purchase_age_rows.empty else base_end
+    base_purchase_cum_tax = float(base_purchase_row.get("Cumulative Estimated Tax", 0.0) or 0.0)
+    base_purchase_aca_cost = float(base_purchase_row.get("ACA Annual Healthcare Cost", 0.0) or 0.0)
     base_future_tax_after_purchase = float(base_end.get("Cumulative Estimated Tax", 0.0)) - base_purchase_cum_tax
     base_rmd_check = estimate_rmd_at_age_from_projection(baseline_no_purchase, rmd_check_age)
     base_td_check = bucket_at_age_from_projection(baseline_no_purchase, rmd_check_age, "Tax-deferred")
@@ -3594,6 +4921,12 @@ def page_purchase_planner() -> None:
         rmd_check = estimate_rmd_at_age_from_projection(proj, rmd_check_age)
         td_check = bucket_at_age_from_projection(proj, rmd_check_age, "Tax-deferred")
 
+        aca_status = str(pr.get("ACA Status", "Not ACA year"))
+        aca_cost_status = str(pr.get("ACA Cost Status", "Not ACA year"))
+        aca_healthcare_cost = float(pr.get("ACA Annual Healthcare Cost", 0.0) or 0.0)
+        aca_cost_change = aca_healthcare_cost - base_purchase_aca_cost
+        aca_over_target = purchase_is_aca_year and (aca_status != "Under target" or "Over" in aca_cost_status or "cliff" in aca_cost_status.lower())
+
         optimizer_rows.append({
             "Candidate": label,
             "Suggested Cash": float(pr.get("Purchase Cash Withdrawal", 0.0) or 0.0),
@@ -3601,6 +4934,13 @@ def page_purchase_planner() -> None:
             "Suggested Tax-deferred": float(pr.get("Purchase Tax-deferred Withdrawal", 0.0) or 0.0),
             "Suggested Roth": float(pr.get("Purchase Roth Withdrawal", 0.0) or 0.0),
             "Purchase-year Tax": float(pr.get("Purchase Estimated Tax", 0.0) or 0.0),
+            "ACA MAGI After Purchase": float(pr.get("ACA MAGI After Conversion", 0.0) or 0.0),
+            "ACA Headroom After Purchase": float(pr.get("ACA Headroom After Conversion", 0.0) or 0.0),
+            "ACA Healthcare Cost": aca_healthcare_cost,
+            "ACA Cost Change": aca_cost_change,
+            "ACA Status": aca_status,
+            "ACA Cost Status": aca_cost_status,
+            "ACA Safe?": "No" if aca_over_target else "Yes",
             "Lifetime Tax Impact": float(end.get("Cumulative Estimated Tax", 0.0) or 0.0) - float(base_end.get("Cumulative Estimated Tax", 0.0) or 0.0),
             "Future Tax Change After Purchase": future_tax_change,
             "Future Tax Savings After Purchase": max(-future_tax_change, 0.0),
@@ -3616,13 +4956,24 @@ def page_purchase_planner() -> None:
 
     opt = pd.DataFrame(optimizer_rows)
     if not opt.empty:
-        # Preserve Roth when close: among candidates without shortfall, show strongest after-tax result first.
-        opt = opt.sort_values(["Shortfall", "After-tax Ending Impact", "Future Tax Savings After Purchase"], ascending=[True, False, False])
+        # If the purchase happens during ACA years, avoid candidates that blow the ACA target/cliff
+        # before choosing the strongest after-tax ending value. Outside ACA years, use the old sort.
+        if purchase_is_aca_year and "ACA Safe?" in opt.columns:
+            opt["ACA Sort Penalty"] = opt["ACA Safe?"].map({"Yes": 0, "No": 1}).fillna(0)
+            opt = opt.sort_values(
+                ["Shortfall", "ACA Sort Penalty", "ACA Cost Change", "After-tax Ending Impact", "Future Tax Savings After Purchase"],
+                ascending=[True, True, True, False, False],
+            )
+        else:
+            opt = opt.sort_values(["Shortfall", "After-tax Ending Impact", "Future Tax Savings After Purchase"], ascending=[True, False, False])
         best = opt.iloc[0]
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Best candidate", str(best["Candidate"]))
         m2.metric("Suggested purchase-year tax", format_money(float(best["Purchase-year Tax"])))
-        m3.metric("Future tax savings after purchase", format_money(float(best["Future Tax Savings After Purchase"])))
+        if purchase_is_aca_year:
+            m3.metric("ACA cost change in purchase year", format_money(float(best["ACA Cost Change"])))
+        else:
+            m3.metric("Future tax savings after purchase", format_money(float(best["Future Tax Savings After Purchase"])))
         m4.metric(f"RMD reduction at {rmd_check_age}", format_money(float(best[f"RMD Reduction at {rmd_check_age}"])))
 
         show_cols = [
@@ -3632,6 +4983,13 @@ def page_purchase_planner() -> None:
             "Suggested Tax-deferred",
             "Suggested Roth",
             "Purchase-year Tax",
+            "ACA Safe?",
+            "ACA MAGI After Purchase",
+            "ACA Headroom After Purchase",
+            "ACA Healthcare Cost",
+            "ACA Cost Change",
+            "ACA Status",
+            "ACA Cost Status",
             "Future Tax Change After Purchase",
             "Future Tax Savings After Purchase",
             f"RMD Reduction at {rmd_check_age}",
@@ -3644,7 +5002,7 @@ def page_purchase_planner() -> None:
         ]
         opt_display = opt[show_cols].copy()
         for col in opt_display.columns:
-            if col not in {"Candidate", "Lowers Future Taxes?", "Note"}:
+            if col not in {"Candidate", "Lowers Future Taxes?", "ACA Safe?", "ACA Status", "ACA Cost Status", "Note"}:
                 opt_display[col] = opt_display[col].map(lambda x: format_money(float(x)))
         st.dataframe(
             opt_display,
@@ -3657,6 +5015,13 @@ def page_purchase_planner() -> None:
                 "Suggested Tax-deferred": st.column_config.TextColumn("Suggested Tax-deferred", help="Purchase amount modeled from traditional 401k/IRA money. This can create current ordinary income tax but may reduce future RMDs."),
                 "Suggested Roth": st.column_config.TextColumn("Suggested Roth", help="Purchase amount modeled from Roth. Usually preserved unless intentionally tested."),
                 "Purchase-year Tax": st.column_config.TextColumn("Purchase-year Tax", help="Estimated incremental tax created by funding the purchase in the purchase year."),
+                "ACA Safe?": st.column_config.TextColumn("ACA Safe?", help="For purchase ages inside the ACA window, Yes means the candidate stays under the modeled ACA MAGI target/cliff."),
+                "ACA MAGI After Purchase": st.column_config.TextColumn("ACA MAGI After Purchase", help="Estimated ACA MAGI in the purchase year after Roth conversions and purchase funding effects."),
+                "ACA Headroom After Purchase": st.column_config.TextColumn("ACA Headroom After Purchase", help="Remaining room under the ACA MAGI target after the purchase."),
+                "ACA Healthcare Cost": st.column_config.TextColumn("ACA Healthcare Cost", help="Estimated household ACA premium/OOP cost in the purchase year."),
+                "ACA Cost Change": st.column_config.TextColumn("ACA Cost Change", help="Purchase-year ACA healthcare cost change versus the no-purchase baseline."),
+                "ACA Status": st.column_config.TextColumn("ACA Status", help="Whether the purchase-year row remains under the ACA target."),
+                "ACA Cost Status": st.column_config.TextColumn("ACA Cost Status", help="Subsidy status from the ACA cost model."),
                 "Future Tax Change After Purchase": st.column_config.TextColumn("Future Tax Change After Purchase", help="Modeled cumulative tax change after the purchase year versus no purchase. Negative means future taxes are lower."),
                 "Future Tax Savings After Purchase": st.column_config.TextColumn("Future Tax Savings After Purchase", help="Positive display of future tax reduction after the purchase year. This is where using some tax-deferred money can show benefits."),
                 f"RMD Reduction at {rmd_check_age}": st.column_config.TextColumn(f"RMD Reduction at {rmd_check_age}", help="Estimated reduction in forced RMD at the selected later age versus no purchase."),
@@ -3669,8 +5034,229 @@ def page_purchase_planner() -> None:
             },
         )
         st.caption(
-            "Use this as a planning signal, not tax advice. The optimizer intentionally separates purchase-year tax from future tax changes so you can see cases where spending from tax-deferred accounts raises taxes now but lowers future RMD/tax pressure."
+            "Use this as a planning signal, not tax advice. The optimizer now separates purchase-year tax, ACA healthcare/subsidy impact, and future tax changes. "
+            "During ACA years, a strategy that looks tax-efficient long term may be a bad funding choice if it pushes MAGI over the ACA cliff."
         )
+
+    st.subheader("Purchase timing comparison")
+    st.caption(
+        "This answers the timing question: does the same purchase look better before, during, or after ACA years? "
+        "The table tests the selected purchase amount across a range of ages and shows the best ACA-aware candidate at each age."
+    )
+
+    timing_col1, timing_col2, timing_col3 = st.columns(3)
+    default_start_age = max(int(float(assumptions.get("retirement_age", 57))), purchase_age - 3)
+    default_end_age = min(90, purchase_age + 8)
+    default_latest_enjoyable_age = min(default_end_age, max(aca_end_age(assumptions) + 2, purchase_age + 3))
+    with timing_col1:
+        timing_start_age = st.number_input(
+            "Timing comparison start age",
+            min_value=int(float(assumptions.get("current_age", 52))),
+            max_value=120,
+            value=int(default_start_age),
+            step=1,
+            help="First purchase age to test."
+        )
+    with timing_col2:
+        timing_end_age = st.number_input(
+            "Timing comparison end age",
+            min_value=int(timing_start_age),
+            max_value=120,
+            value=int(default_end_age),
+            step=1,
+            help="Last purchase age to test."
+        )
+    with timing_col3:
+        latest_enjoyable_age = st.number_input(
+            "Latest age you actually want it",
+            min_value=int(timing_start_age),
+            max_value=int(timing_end_age),
+            value=int(min(max(default_latest_enjoyable_age, timing_start_age), timing_end_age)),
+            step=1,
+            help="Lifestyle/practical cutoff. The app will show an earliest-practical recommendation so the math does not blindly push the purchase too late."
+        )
+
+    prefer_traditional_after_aca = st.checkbox(
+        "After ACA, prefer tax-deferred funding if fully funded",
+        value=True,
+        help=(
+            "Useful when you do not care about leaving a large estate and would rather use traditional 401k/IRA dollars after ACA ends, "
+            "pay the tax, and reduce future RMD pressure."
+        ),
+    )
+    st.caption(
+        "Timing results now separate the mathematically best age from the practical/lifestyle-first age. "
+        "For a boat or lifestyle upgrade, the earliest ACA-safe post-ACA age may be more useful than the age with the highest ending portfolio."
+    )
+
+    timing_rows = []
+    for test_age in range(int(timing_start_age), int(timing_end_age) + 1):
+        # Baseline for this age: same projection without the purchase.
+        baseline_for_age = projection_with_after_tax_estimate(
+            build_projection(years, assumptions, roth_scenario=dashboard_roth_scenario, ignore_purchases=True),
+            assumptions,
+        )
+        base_end_for_age = baseline_for_age.iloc[-1]
+        base_age_rows = baseline_for_age[baseline_for_age["Age"].astype(int) == int(test_age)]
+        base_age_row = base_age_rows.iloc[0] if not base_age_rows.empty else base_end_for_age
+        base_age_aca_cost = float(base_age_row.get("ACA Annual Healthcare Cost", 0.0) or 0.0)
+        test_is_aca_year = aca_start_age(assumptions) <= int(test_age) <= aca_end_age(assumptions)
+
+        candidate_rows_for_age = []
+        for label, strategy, note in purchase_optimizer_candidate_strategies():
+            tmp = pd.DataFrame([{
+                "name": selected_purchase["name"],
+                "purchase_age": int(test_age),
+                "amount": float(selected_purchase["amount"]),
+                "funding_strategy": strategy,
+                "include_in_projection": 1,
+                "notes": selected_purchase.get("notes", ""),
+            }])
+            proj = projection_with_after_tax_estimate(
+                build_projection(years, assumptions, roth_scenario=dashboard_roth_scenario, purchases_override=tmp),
+                assumptions,
+            )
+            end = proj.iloc[-1]
+            purchase_year_rows = proj[proj["Age"].astype(int) == int(test_age)]
+            pr = purchase_year_rows.iloc[0] if not purchase_year_rows.empty else end
+
+            aca_status = str(pr.get("ACA Status", "Not ACA year"))
+            aca_cost_status = str(pr.get("ACA Cost Status", "Not ACA year"))
+            aca_healthcare_cost = float(pr.get("ACA Annual Healthcare Cost", 0.0) or 0.0)
+            aca_cost_change = aca_healthcare_cost - base_age_aca_cost
+            aca_over_target = test_is_aca_year and (aca_status != "Under target" or "Over" in aca_cost_status or "cliff" in aca_cost_status.lower())
+
+            candidate_rows_for_age.append({
+                "Purchase Age": int(test_age),
+                "ACA Year?": "Yes" if test_is_aca_year else "No",
+                "Candidate": label,
+                "ACA Safe?": "No" if aca_over_target else "Yes",
+                "ACA MAGI After Purchase": float(pr.get("ACA MAGI After Conversion", 0.0) or 0.0),
+                "ACA Headroom After Purchase": float(pr.get("ACA Headroom After Conversion", 0.0) or 0.0),
+                "ACA Healthcare Cost": aca_healthcare_cost,
+                "ACA Cost Change": aca_cost_change,
+                "Purchase-year Tax": float(pr.get("Purchase Estimated Tax", 0.0) or 0.0),
+                "Shortfall": float(pr.get("Purchase Shortfall", 0.0) or 0.0),
+                "After-tax Ending Impact": float(end.get("After-tax Estimate", 0.0) or 0.0) - float(base_end_for_age.get("After-tax Estimate", 0.0) or 0.0),
+                "Ending Tax-deferred": float(end.get("Tax-deferred", 0.0) or 0.0),
+                "Note": note,
+            })
+
+        candidates_for_age = pd.DataFrame(candidate_rows_for_age)
+        if candidates_for_age.empty:
+            continue
+
+        # Pure modeled best for reference.
+        modeled_best_for_age = candidates_for_age.sort_values(
+            ["Shortfall", "After-tax Ending Impact"],
+            ascending=[True, False],
+        ).iloc[0]
+
+        if test_is_aca_year:
+            candidates_for_age["ACA Sort Penalty"] = candidates_for_age["ACA Safe?"].map({"Yes": 0, "No": 1}).fillna(0)
+            candidates_for_age = candidates_for_age.sort_values(
+                ["Shortfall", "ACA Sort Penalty", "ACA Cost Change", "After-tax Ending Impact"],
+                ascending=[True, True, True, False],
+            )
+        else:
+            if prefer_traditional_after_aca and int(test_age) > aca_end_age(assumptions):
+                trad_rows = candidates_for_age[
+                    (candidates_for_age["Candidate"] == "Tax-deferred only")
+                    & (candidates_for_age["Shortfall"].astype(float) <= 0.0)
+                ]
+                if not trad_rows.empty:
+                    candidates_for_age = pd.concat([
+                        trad_rows,
+                        candidates_for_age[candidates_for_age["Candidate"] != "Tax-deferred only"],
+                    ], ignore_index=True)
+                else:
+                    candidates_for_age = candidates_for_age.sort_values(
+                        ["Shortfall", "After-tax Ending Impact"],
+                        ascending=[True, False],
+                    )
+            else:
+                candidates_for_age = candidates_for_age.sort_values(
+                    ["Shortfall", "After-tax Ending Impact"],
+                    ascending=[True, False],
+                )
+
+        best_for_age = candidates_for_age.iloc[0].to_dict()
+        best_for_age["Modeled Best Candidate"] = str(modeled_best_for_age["Candidate"])
+        best_for_age["Modeled Best After-tax Impact"] = float(modeled_best_for_age["After-tax Ending Impact"])
+        timing_rows.append(best_for_age)
+
+    timing = pd.DataFrame(timing_rows)
+    if not timing.empty:
+        timing_display = timing.drop(columns=["ACA Sort Penalty"], errors="ignore").copy()
+        money_cols = [
+            "ACA MAGI After Purchase",
+            "ACA Headroom After Purchase",
+            "ACA Healthcare Cost",
+            "ACA Cost Change",
+            "Purchase-year Tax",
+            "Shortfall",
+            "After-tax Ending Impact",
+            "Ending Tax-deferred",
+            "Modeled Best After-tax Impact",
+        ]
+        for col in money_cols:
+            if col in timing_display.columns:
+                timing_display[col] = timing_display[col].map(lambda x: format_money(float(x)))
+        st.dataframe(
+            timing_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Purchase Age": st.column_config.NumberColumn("Purchase Age", help="Age being tested for the selected purchase."),
+                "ACA Year?": st.column_config.TextColumn("ACA Year?", help="Whether this age is inside the modeled ACA window."),
+                "Candidate": st.column_config.TextColumn("Practical candidate", help="Candidate selected after ACA-safety and lifestyle preferences. This may differ from the pure modeled after-tax best."),
+                "Modeled Best Candidate": st.column_config.TextColumn("Modeled Best Candidate", help="The pure highest after-tax ending value candidate for this age, before lifestyle-first overrides."),
+                "ACA Safe?": st.column_config.TextColumn("ACA Safe?", help="During ACA years, Yes means the best candidate remains under the modeled ACA target/cliff."),
+                "ACA MAGI After Purchase": st.column_config.TextColumn("ACA MAGI After Purchase", help="Estimated MAGI in the purchase year."),
+                "ACA Headroom After Purchase": st.column_config.TextColumn("ACA Headroom After Purchase", help="Remaining ACA MAGI room after purchase funding."),
+                "ACA Healthcare Cost": st.column_config.TextColumn("ACA Healthcare Cost", help="Estimated household ACA healthcare cost in the purchase year."),
+                "ACA Cost Change": st.column_config.TextColumn("ACA Cost Change", help="Purchase-year ACA healthcare cost change versus no purchase."),
+                "Purchase-year Tax": st.column_config.TextColumn("Purchase-year Tax", help="Estimated incremental tax in the purchase year."),
+                "After-tax Ending Impact": st.column_config.TextColumn("After-tax Ending Impact", help="Ending after-tax estimate versus no purchase baseline."),
+                "Ending Tax-deferred": st.column_config.TextColumn("Ending Tax-deferred", help="Traditional/tax-deferred balance at the end of the projection for this timing/candidate."),
+                "Modeled Best After-tax Impact": st.column_config.TextColumn("Modeled Best After-tax Impact", help="After-tax ending impact for the pure modeled-best candidate at this purchase age."),
+            },
+        )
+
+        fully_funded_timing = timing[timing["Shortfall"].astype(float) <= 0.0].copy()
+        aca_safe_timing = fully_funded_timing[fully_funded_timing["ACA Safe?"] == "Yes"].copy()
+
+        if not aca_safe_timing.empty:
+            modeled_best_timing = aca_safe_timing.sort_values(["After-tax Ending Impact"], ascending=[False]).iloc[0]
+            st.info(
+                f"Pure modeled-best ACA-safe timing in this range: age {int(modeled_best_timing['Purchase Age'])} "
+                f"using {modeled_best_timing['Candidate']}. This maximizes modeled after-tax ending value, not lifestyle enjoyment."
+            )
+
+            practical_pool = aca_safe_timing[
+                (aca_safe_timing["Purchase Age"].astype(int) > aca_end_age(assumptions))
+                & (aca_safe_timing["Purchase Age"].astype(int) <= int(latest_enjoyable_age))
+            ].copy()
+            if practical_pool.empty:
+                practical_pool = aca_safe_timing[aca_safe_timing["Purchase Age"].astype(int) <= int(latest_enjoyable_age)].copy()
+
+            if not practical_pool.empty:
+                practical_timing = practical_pool.sort_values(["Purchase Age"], ascending=[True]).iloc[0]
+                st.success(
+                    f"Lifestyle-first timing: age {int(practical_timing['Purchase Age'])} "
+                    f"using {practical_timing['Candidate']}. This prioritizes buying soon after ACA risk is gone rather than waiting for the mathematically highest ending balance."
+                )
+            else:
+                st.warning(
+                    f"No ACA-safe, fully funded option was found by your latest enjoyable age of {int(latest_enjoyable_age)}. "
+                    "Try increasing cash/taxable funding, shrinking the purchase, or accepting ACA/tax tradeoffs."
+                )
+        else:
+            st.warning(
+                "No ACA-safe, fully funded timing option was found in this range. "
+                "Try delaying the purchase until after the ACA window or increasing cash/taxable funding."
+            )
+
 
 
 def page_scenarios() -> None:
@@ -3748,6 +5334,207 @@ def page_scenarios() -> None:
 # App entry
 # -----------------------------
 
+
+def page_aca_planner() -> None:
+    st.title("ACA Planner")
+    st.caption(
+        "Central place for ACA/healthcare assumptions. Premium numbers are household annual totals for both of you together, not per person."
+    )
+
+    assumptions = get_assumptions()
+
+    st.info(
+        "Current model: ACA premium tax credits are based on household MAGI and FPL. "
+        "The app supports a formula mode using benchmark silver premium, selected-plan premium, FPL %, and an optional 400% FPL cliff, plus a manual simple under/over-target mode."
+    )
+
+    with st.form("aca_planner_settings"):
+        st.subheader("ACA household and timing")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            household_size = st.number_input(
+                "ACA household size",
+                min_value=1,
+                max_value=10,
+                value=int(float(assumptions.get("aca_household_size", 2))),
+                step=1,
+                help="Used as a reminder. The FPL dollar amount below is what the model actually uses."
+            )
+        with c2:
+            fpl100 = st.number_input(
+                "100% FPL amount for household",
+                min_value=0.0,
+                value=float(assumptions.get("aca_fpl_100", 21150)),
+                step=100.0,
+                help="For 2026 coverage, 100% FPL for household size 2 is $21,150."
+            )
+        with c3:
+            target_pct = st.number_input(
+                "ACA target % FPL",
+                min_value=100.0,
+                max_value=800.0,
+                value=float(assumptions.get("aca_target_fpl_percent", 400)),
+                step=10.0,
+                help="Used by Optimize ACA to target MAGI headroom. 400% is the classic subsidy-cliff threshold."
+            )
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            safety_buffer = st.number_input(
+                "MAGI safety buffer",
+                min_value=0.0,
+                value=float(assumptions.get("aca_magi_safety_buffer", 1000)),
+                step=100.0,
+                help="Subtracts this from the MAGI target to avoid modeling exactly on the cliff."
+            )
+        with c5:
+            medicare_age = st.number_input(
+                "Medicare age",
+                min_value=60,
+                max_value=70,
+                value=int(float(assumptions.get("aca_medicare_age", 65))),
+                step=1,
+                help="ACA modeling normally ends the year before Medicare."
+            )
+        with c6:
+            st.metric("Modeled ACA window", f"{aca_start_age(assumptions)}–{aca_end_age(assumptions)}")
+
+        st.subheader("ACA premium model")
+        model_mode = st.selectbox(
+            "ACA cost model",
+            ["Formula", "Manual under/over target"],
+            index=0 if str(assumptions.get("aca_model_mode", "Formula")).lower().startswith("formula") else 1,
+            help="Formula mode estimates subsidy from benchmark premium and MAGI. Manual mode uses simple under/over annual premium amounts."
+        )
+        use_cliff = st.checkbox(
+            "Apply 400% FPL subsidy cliff",
+            value=assumptions.get("aca_use_400_fpl_cliff", "1") == "1",
+            help="Current 2026-style rules can create a cliff above 400% FPL if enhanced subsidies are not extended."
+        )
+
+        c7, c8 = st.columns(2)
+        with c7:
+            benchmark = st.number_input(
+                "Benchmark Silver annual premium — household total",
+                min_value=0.0,
+                value=float(assumptions.get("aca_benchmark_silver_annual_premium", 26000)),
+                step=500.0,
+                help="Full annual premium for the second-lowest-cost Silver plan for both of you together."
+            )
+        with c8:
+            selected_plan = st.number_input(
+                "Selected plan annual premium — household total",
+                min_value=0.0,
+                value=float(assumptions.get("aca_selected_plan_annual_premium", 22000)),
+                step=500.0,
+                help="Full annual premium for the plan you expect to buy, for both of you together."
+            )
+
+        c9, c10 = st.columns(2)
+        with c9:
+            subsidized_manual = st.number_input(
+                "Manual annual premium if under target — household total",
+                min_value=0.0,
+                value=float(assumptions.get("aca_subsidized_annual_premium", 6000)),
+                step=500.0,
+                help="Only used in Manual mode."
+            )
+        with c10:
+            full_manual = st.number_input(
+                "Manual annual premium if over target — household total",
+                min_value=0.0,
+                value=float(assumptions.get("aca_full_annual_premium", 18000)),
+                step=500.0,
+                help="Only used in Manual mode."
+            )
+
+        include_oop = st.checkbox(
+            "Include rough out-of-pocket estimate",
+            value=assumptions.get("aca_include_oop_estimate", "0") == "1",
+            help="Optional rough estimate. Premiums are usually the first thing to model; OOP is much harder to predict."
+        )
+        c11, c12 = st.columns(2)
+        with c11:
+            oop_under = st.number_input(
+                "Annual OOP estimate if under target",
+                min_value=0.0,
+                value=float(assumptions.get("aca_oop_if_under_target", 3000)),
+                step=500.0,
+            )
+        with c12:
+            oop_over = st.number_input(
+                "Annual OOP estimate if over target",
+                min_value=0.0,
+                value=float(assumptions.get("aca_oop_if_over_target", 6000)),
+                step=500.0,
+            )
+
+        st.subheader("Medicare / IRMAA rough estimate")
+        c13, c14 = st.columns(2)
+        with c13:
+            irmaa_threshold = st.number_input(
+                "IRMAA MAGI threshold estimate",
+                min_value=0.0,
+                value=float(assumptions.get("irmaa_magi_threshold", 206000)),
+                step=1000.0,
+            )
+        with c14:
+            irmaa_surcharge = st.number_input(
+                "Estimated annual IRMAA surcharge",
+                min_value=0.0,
+                value=float(assumptions.get("irmaa_annual_surcharge", 0)),
+                step=100.0,
+            )
+
+        submitted = st.form_submit_button("Save ACA / healthcare settings", type="primary")
+        if submitted:
+            set_assumption("aca_household_size", str(int(household_size)))
+            set_assumption("aca_fpl_100", str(float(fpl100)))
+            set_assumption("aca_target_fpl_percent", str(float(target_pct)))
+            set_assumption("aca_magi_safety_buffer", str(float(safety_buffer)))
+            set_assumption("aca_medicare_age", str(int(medicare_age)))
+            set_assumption("aca_start_age", "auto")
+            set_assumption("aca_end_age", "auto")
+            set_assumption("aca_model_mode", model_mode)
+            set_assumption("aca_use_400_fpl_cliff", "1" if use_cliff else "0")
+            set_assumption("aca_benchmark_silver_annual_premium", str(float(benchmark)))
+            set_assumption("aca_selected_plan_annual_premium", str(float(selected_plan)))
+            set_assumption("aca_subsidized_annual_premium", str(float(subsidized_manual)))
+            set_assumption("aca_full_annual_premium", str(float(full_manual)))
+            set_assumption("aca_include_oop_estimate", "1" if include_oop else "0")
+            set_assumption("aca_oop_if_under_target", str(float(oop_under)))
+            set_assumption("aca_oop_if_over_target", str(float(oop_over)))
+            set_assumption("irmaa_magi_threshold", str(float(irmaa_threshold)))
+            set_assumption("irmaa_annual_surcharge", str(float(irmaa_surcharge)))
+            st.success("ACA / healthcare settings saved.")
+            st.rerun()
+
+    st.subheader("ACA cost preview")
+    preview_magi_values = [
+        aca_magi_limit(assumptions) * 0.75,
+        aca_magi_limit(assumptions),
+        aca_magi_limit(assumptions) + 1000,
+        aca_magi_limit(assumptions) * 1.25,
+    ]
+    rows = []
+    for magi in preview_magi_values:
+        cost = estimate_aca_annual_cost_from_magi(magi, assumptions)
+        rows.append({
+            "MAGI": magi,
+            "FPL %": cost["ACA FPL Percent"],
+            "Estimated Subsidy": cost["ACA Estimated Subsidy"],
+            "Premium Cost": cost["ACA Annual Premium Cost"],
+            "OOP Estimate": cost["ACA Annual OOP Estimate"],
+            "Total Healthcare Cost": cost["ACA Annual Healthcare Cost"],
+            "Status": cost["ACA Cost Status"],
+        })
+    preview = pd.DataFrame(rows)
+    for col in ["MAGI", "Estimated Subsidy", "Premium Cost", "OOP Estimate", "Total Healthcare Cost"]:
+        preview[col] = preview[col].map(lambda x: format_money(float(x)))
+    preview["FPL %"] = preview["FPL %"].map(lambda x: f"{float(x):.0f}%")
+    st.dataframe(preview, hide_index=True, use_container_width=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="Retirement Planner", page_icon="📈", layout="wide")
     init_db()
@@ -3761,7 +5548,7 @@ def main() -> None:
 
     with st.sidebar:
         st.title("Planner")
-        page = st.radio("Navigate", ["Dashboard", "Balances", "Accounts", "Contributions", "Assumptions", "Roth Conversions", "Purchase Planner", "Scenarios"])
+        page = st.radio("Navigate", ["Dashboard", "Balances", "Accounts", "Contributions", "Assumptions", "ACA Planner", "Roth Conversions", "Purchase Planner", "Scenarios"])
         st.divider()
         st.caption(f"Database: {DB_PATH.resolve()}")
 
@@ -3818,6 +5605,8 @@ def main() -> None:
         page_contributions()
     elif page == "Assumptions":
         page_assumptions()
+    elif page == "ACA Planner":
+        page_aca_planner()
     elif page == "Roth Conversions":
         page_roth_conversions()
     elif page == "Purchase Planner":
