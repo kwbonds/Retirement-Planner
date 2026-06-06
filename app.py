@@ -4132,21 +4132,89 @@ def page_roth_conversions() -> None:
         selected = st.selectbox("Scenario", names)
         scenario = active_scenarios.loc[active_scenarios["name"] == selected].iloc[0].to_dict()
 
-        active_detail_purchases = read_planned_purchases(active_only=True)
+        active_detail_purchases_base = read_planned_purchases(active_only=True)
         saved_purchase_chart_default = assumptions.get("show_purchase_impact_on_dashboard_chart", "1") == "1"
         include_detail_purchases = True
-        if not active_detail_purchases.empty:
-            include_detail_purchases = st.checkbox(
-                "Include active planned purchases in this detailed scenario chart and Roth conversion chart",
-                value=saved_purchase_chart_default,
-                help=(
-                    "When checked, active purchases reduce the projected buckets and can change Roth conversions, "
-                    "withdrawals, ACA MAGI, taxes, and future balances. When unchecked, this detailed scenario area "
-                    "shows the same plan without those purchase impacts."
-                ),
-                key="detail_include_purchase_impacts",
+        detail_purchase_funding_override = assumptions.get("dashboard_purchase_funding_override", "Auto practical candidate")
+        detail_purchase_age_override_enabled = assumptions.get("dashboard_purchase_age_override_enabled", "0") == "1"
+        detail_purchase_age_override_raw = int(float(assumptions.get("dashboard_purchase_age_override", 0) or 0))
+
+        if not active_detail_purchases_base.empty:
+            detail_ctrl1, detail_ctrl2, detail_ctrl3 = st.columns([1.4, 2.0, 2.0])
+            with detail_ctrl1:
+                include_detail_purchases = st.checkbox(
+                    "Include active planned purchases in this detailed scenario chart and Roth conversion chart",
+                    value=saved_purchase_chart_default,
+                    help=(
+                        "When checked, active purchases reduce the projected buckets and can change Roth conversions, "
+                        "withdrawals, ACA MAGI, taxes, and future balances. When unchecked, this detailed scenario area "
+                        "shows the same plan without those purchase impacts."
+                    ),
+                    key="detail_include_purchase_impacts",
+                )
+
+            with detail_ctrl2:
+                detail_purchase_options = ["Auto practical candidate", "Saved purchase strategy"] + purchase_funding_candidate_labels()
+                detail_idx = (
+                    detail_purchase_options.index(detail_purchase_funding_override)
+                    if detail_purchase_funding_override in detail_purchase_options
+                    else 0
+                )
+                detail_purchase_funding_override = st.selectbox(
+                    "Detailed chart purchase funding",
+                    detail_purchase_options,
+                    index=detail_idx,
+                    disabled=not include_detail_purchases,
+                    help=(
+                        "Controls purchase funding inside this Roth scenario detail view. "
+                        "Auto practical candidate recalculates by age and scenario; Saved purchase strategy follows the Purchase Planner row."
+                    ),
+                    key="detail_purchase_funding_override",
+                )
+
+            with detail_ctrl3:
+                detail_age_override_enabled = st.checkbox(
+                    "Override purchase age here",
+                    value=detail_purchase_age_override_enabled,
+                    disabled=not include_detail_purchases,
+                    help="Scenario-detail-only control for moving the purchase age in this Roth chart/table.",
+                    key="detail_purchase_age_override_enabled",
+                )
+                default_detail_purchase_age = (
+                    int(active_detail_purchases_base.iloc[0]["purchase_age"])
+                    if not active_detail_purchases_base.empty
+                    else int(float(assumptions.get("retirement_age", 57)))
+                )
+                detail_purchase_age_override = detail_purchase_age_override_raw if detail_purchase_age_override_raw > 0 else default_detail_purchase_age
+                detail_purchase_age_override = st.slider(
+                    "Detailed purchase age",
+                    min_value=int(float(assumptions.get("current_age", 52))),
+                    max_value=90,
+                    value=int(detail_purchase_age_override),
+                    step=1,
+                    disabled=not include_detail_purchases or not detail_age_override_enabled,
+                    help="Move the active purchase earlier/later in this Roth scenario detail projection.",
+                    key="detail_purchase_age_override",
+                )
+                if detail_age_override_enabled and detail_purchase_funding_override == "Saved purchase strategy":
+                    st.caption("Tip: choose Auto practical candidate if you want funding to change as this age changes.")
+
+            detail_age_override_value = int(detail_purchase_age_override) if detail_age_override_enabled else None
+            active_detail_purchases, effective_detail_purchase_funding = (
+                dashboard_purchase_rows_with_override(
+                    active_detail_purchases_base,
+                    detail_purchase_funding_override,
+                    assumptions=assumptions,
+                    roth_scenario=scenario,
+                    years=years,
+                    age_override=detail_age_override_value,
+                )
+                if include_detail_purchases
+                else (pd.DataFrame(), "")
             )
         else:
+            active_detail_purchases = pd.DataFrame()
+            effective_detail_purchase_funding = ""
             st.caption("No active planned purchases are currently available to include in this detailed scenario view.")
 
         proj = projection_with_after_tax_estimate(
@@ -4154,13 +4222,49 @@ def page_roth_conversions() -> None:
                 years,
                 assumptions,
                 roth_scenario=scenario,
+                purchases_override=active_detail_purchases if include_detail_purchases else None,
                 ignore_purchases=not include_detail_purchases,
             ),
             assumptions,
         )
-        if not active_detail_purchases.empty:
+        if not active_detail_purchases_base.empty:
             if include_detail_purchases:
-                st.caption("Active planned purchases are included in the detailed balance chart, Roth conversion chart, and table below.")
+                included_summary = ", ".join(
+                    f"{str(r['name'])} at age {int(r['purchase_age'])} ({format_money(float(r['amount']))}, funded by {purchase_strategy_display_name(str(r['funding_strategy']))})"
+                    for _, r in active_detail_purchases.iterrows()
+                )
+                st.caption(f"Active planned purchases are included here using: {included_summary}.")
+                purchase_ages = set(active_detail_purchases["purchase_age"].astype(int).tolist())
+                detail_purchase_rows = proj[proj["Age"].astype(int).isin(purchase_ages)].copy()
+                if not detail_purchase_rows.empty:
+                    breakdown_cols = [
+                        "Age",
+                        "Purchase Names",
+                        "Purchase Funding Strategy",
+                        "Purchase Amount",
+                        "Purchase Cash Withdrawal",
+                        "Purchase Taxable Withdrawal",
+                        "Purchase Tax-deferred Withdrawal",
+                        "Purchase Roth Withdrawal",
+                        "Purchase Estimated Tax",
+                        "ACA MAGI After Conversion",
+                        "ACA Status",
+                    ]
+                    breakdown_cols = [c for c in breakdown_cols if c in detail_purchase_rows.columns]
+                    breakdown = detail_purchase_rows[breakdown_cols].copy()
+                    for col in [
+                        "Purchase Amount",
+                        "Purchase Cash Withdrawal",
+                        "Purchase Taxable Withdrawal",
+                        "Purchase Tax-deferred Withdrawal",
+                        "Purchase Roth Withdrawal",
+                        "Purchase Estimated Tax",
+                        "ACA MAGI After Conversion",
+                    ]:
+                        if col in breakdown.columns:
+                            breakdown[col] = breakdown[col].map(lambda x: format_money(float(x)))
+                    st.caption("Detailed scenario purchase funding breakdown for this chart:")
+                    st.dataframe(breakdown, use_container_width=True, hide_index=True)
             else:
                 st.caption("Active planned purchases are hidden here, so the detailed balance chart, Roth conversion chart, and table below show the plan without purchase impacts.")
         fig2 = go.Figure()
